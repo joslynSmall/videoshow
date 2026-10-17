@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="多平台视频解析与弹幕播放服务">
+  <title>videoshow · 视频解析</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c6f36b'/%3E%3Cpath d='M12 9v14l11-7z' fill='%230b0d0c'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/vendor/hls.min.js"></script>
+  <script defer src="/vendor/artplayer.js"></script>
+  <script defer src="/vendor/artplayer-plugin-danmuku.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="videoshow 首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+            <title>videoshow</title>
+            <path d="M8 5.5v13l10-6.5-10-6.5Z" fill="currentColor"/>
+          </svg>
+        </span>
+        <span class="brand-name">videoshow</span>
+      </a>
+      <span class="badge">无广告</span>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">Node.js · Video Parse</p>
+        <h1>粘贴链接，<br>直接播放。</h1>
+        <p class="lede">服务端解析视频页链接，返回可播放的 m3u8 或 mp4。没有广告脚本，没有标题劫持；实际支持范围由解析服务决定。</p>
+      </section>
+
+      <form id="parse-form" class="parse-form" action="/" method="get" novalidate>
+        <label class="sr-only" for="url-input">视频链接</label>
+        <div class="input-row">
+          <input id="url-input" name="url" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://..." required>
+          <button id="submit-button" type="submit">解析</button>
+        </div>
+      </form>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <section id="result" class="result" hidden>
+        <div class="player-wrap">
+          <div id="player" class="player"></div>
+        </div>
+        <div class="result-body">
+          <div class="result-copy">
+            <h2 id="video-title">视频</h2>
+            <p id="source-url" class="source-url"></p>
+            <div id="sources-bar" class="sources-bar"></div>
+          </div>
+          <div class="result-actions">
+            <span id="expiry" class="expiry"></span>
+            <button id="copy-button" type="button" class="ghost-button" disabled>复制播放地址</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>服务端只做解析与地址校验，视频分片由源站 CDN 直接提供。</p>
+      <p>请仅解析你有权访问的内容。</p>
+    </footer>
+  </div>
+
+  <noscript>
+    <p class="noscript">需要启用 JavaScript 才能解析和播放。</p>
+  </noscript>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "videoshow",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Clean Node.js HTTP service for parsing video pages into playable streams with danmaku.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "test:live": "RUN_LIVE_TESTS=1 node --test"
+  }
+}

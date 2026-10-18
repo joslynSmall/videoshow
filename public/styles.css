@@ -189,6 +189,35 @@ input {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
+.search-channel {
+  flex: none;
+  min-width: 118px;
+  height: 48px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font: 13px/1 var(--sans);
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.search-channel:hover {
+  border-color: #454f46;
+}
+
+.search-channel:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.search-channel option {
+  background: var(--surface);
+  color: var(--text);
+}
+
 #submit-button {
   flex: none;
   height: 48px;
@@ -1015,7 +1044,19 @@ input {
 
   .input-row {
     flex-direction: row;
+    flex-wrap: wrap;
     gap: 6px;
+  }
+
+  .input-wrap {
+    flex: 1 1 100%;
+  }
+
+  .search-channel {
+    flex: 1 1 auto;
+    min-width: 118px;
+    height: 42px;
+    font-size: 13px;
   }
 
   #url-input {

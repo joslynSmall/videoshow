@@ -51,6 +51,10 @@
               <input id="url-input" name="url" type="text" autocomplete="off" spellcheck="false" placeholder="输入剧名搜索，或粘贴视频页面链接..." required>
               <button id="clear-input-button" type="button" class="clear-button" hidden aria-label="清空输入">&times;</button>
             </div>
+            <select id="search-channel" class="search-channel" aria-label="搜索渠道" title="API 渠道使用聚合接口；视频网站会分别访问各站搜索">
+              <option value="api">API 渠道</option>
+              <option value="sites">视频网站</option>
+            </select>
             <button id="submit-button" type="submit">解析 / 搜索</button>
           </div>
           <div id="search-history" class="search-history" hidden>

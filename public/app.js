@@ -48,6 +48,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   const searchSection = document.querySelector("#search-section");
   const searchGrid = document.querySelector("#search-grid");
+  const searchChannelSelect = document.querySelector("#search-channel");
+  const SEARCH_CHANNEL_KEY = "videoshow_search_channel_v1";
   const searchCount = document.querySelector("#search-count");
   const siteSearchModal = document.querySelector("#site-search-modal");
   const siteSearchTabs = document.querySelector("#site-search-tabs");
@@ -229,6 +231,21 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         localStorage.setItem(AUTOPLAY_NEXT_KEY, autoplayNextInput.checked ? "1" : "0");
       } catch {}
       devlog("自动下一集", { enabled: autoplayNextInput.checked }, "info");
+    });
+  }
+
+  if (searchChannelSelect) {
+    try {
+      searchChannelSelect.value = localStorage.getItem(SEARCH_CHANNEL_KEY) === "sites" ? "sites" : "api";
+    } catch {
+      searchChannelSelect.value = "api";
+    }
+    searchChannelSelect.addEventListener("change", () => {
+      const channel = searchChannelSelect.value === "sites" ? "sites" : "api";
+      try {
+        localStorage.setItem(SEARCH_CHANNEL_KEY, channel);
+      } catch {}
+      devlog("搜索渠道", { channel: channel === "sites" ? "视频网站" : "API 渠道" }, "info");
     });
   }
 
@@ -1597,26 +1614,44 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         setLoading(false);
       }
     } else {
-      // 轨道 B：剧名搜索与选集聚合
-      setStatus(`正在搜索《${query}》，请稍候…`, "loading");
+      // 轨道 B：按搜索渠道二选一
+      const channel = searchChannelSelect?.value === "sites" ? "sites" : "api";
+      searchSection.hidden = true;
+      searchGrid.innerHTML = "";
+
+      if (channel === "sites") {
+        setStatus(`正在通过视频网站搜索《${query}》，请稍候…`, "loading");
+        try {
+          const sites = await searchSites(query);
+          if (sites.length) {
+            openSiteSearch(sites);
+            setStatus("视频网站搜索完成，请选择结果。", "");
+          } else {
+            setStatus("视频网站未找到相关资源。", "");
+          }
+        } catch (err) {
+          setStatus(
+            err instanceof Error ? err.message : "视频网站搜索失败，请稍后重试。",
+            "error",
+          );
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
+
+      setStatus(`正在通过 API 渠道搜索《${query}》，请稍候…`, "loading");
       try {
         const items = await search(query);
         renderSearchResults(items);
         if (items.length) {
           setStatus("搜索完成，请选择剧目观看。", "");
         } else {
-          setStatus("目录没有结果，正在查找视频网站…", "loading");
-          const sites = await searchSites(query);
-          if (sites.length) {
-            openSiteSearch(sites);
-            setStatus("目录没有这部，请从视频网站的结果里选择。", "");
-          } else {
-            setStatus("未找到相关影视资源。", "");
-          }
+          setStatus("API 渠道未找到相关作品，可切换到“视频网站”再试。", "");
         }
       } catch (err) {
         setStatus(
-          err instanceof Error ? err.message : "搜索失败，请稍后重试。",
+          err instanceof Error ? err.message : "API 渠道搜索失败，请稍后重试。",
           "error",
         );
       } finally {

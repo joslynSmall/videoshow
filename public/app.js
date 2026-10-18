@@ -74,6 +74,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   let currentMedia = null; // 当前播放的完整上下文信息
   let progressSaveTimer = 0;
   let stallTimer = 0;
+  let startupTimer = 0;
   let switchingLine = false;
 
   const devlogEl = document.querySelector("#devlog");
@@ -253,6 +254,12 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (!stallTimer) return;
     window.clearTimeout(stallTimer);
     stallTimer = 0;
+  }
+
+  function clearStartupTimer() {
+    if (!startupTimer) return;
+    window.clearTimeout(startupTimer);
+    startupTimer = 0;
   }
 
   /* =========================================================================
@@ -470,6 +477,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   function destroyPlayer() {
+    clearStartupTimer();
     if (art) {
       art.destroy();
       art = null;
@@ -477,21 +485,29 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   async function recoverDirectUrl(url) {
-    const response = await fetch(url, { cache: "no-store" });
-    const text = (await response.text()).replace(/^\uFEFF/, "").trim();
-    if (!text || text.startsWith("#EXTM3U")) return null;
-    let payload;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 4000);
     try {
-      payload = JSON.parse(text);
+      const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+      const text = (await response.text()).replace(/^\uFEFF/, "").trim();
+      if (!text || text.startsWith("#EXTM3U")) return null;
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        return null;
+      }
+      const next = payload?.url;
+      if (typeof next !== "string" || !/^https?:\/\//i.test(next)) return null;
+      return {
+        playUrl: next,
+        type: /\.m3u8(\?|$)/i.test(next) ? "m3u8" : "mp4",
+      };
     } catch {
       return null;
+    } finally {
+      window.clearTimeout(timer);
     }
-    const next = payload?.url;
-    if (typeof next !== "string" || !/^https?:\/\//i.test(next)) return null;
-    return {
-      playUrl: next,
-      type: /\.m3u8(\?|$)/i.test(next) ? "m3u8" : "mp4",
-    };
   }
 
   function playM3u8(video, url, artInstance, onFatal, onAttached) {
@@ -763,6 +779,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (data.playUrl) failed.add(data.playUrl);
     switchingLine = true;
     clearStallTimer();
+    clearStartupTimer();
     setStatus("播放不够流畅，正在更换线路…", "loading");
     devlog("触发换线", {
       from: data.provider || "-",
@@ -818,7 +835,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
             currentMedia.playUrl = chosen.playUrl;
             currentMedia.type = chosen.type;
           }
-          setStatus("", "");
+          const activeVideo = player.querySelector("video");
+          setStatus(activeVideo?.paused ? "线路已切换，请点击播放继续。" : "", "");
           return;
         } catch (err) {
           devlog("换线失败", err instanceof Error ? err.message : String(err), "error");
@@ -939,11 +957,15 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     const danmakuEndpoint = data.danmaku?.endpoint || "";
     let playbackFailed = false;
+    let hasPlayed = false;
+    let startupFallbackUsed = false;
     let sourceAttached = data.type !== "m3u8";
-    const failPlayback = () => {
-      if (!sourceAttached || playbackFailed) return;
+    const failPlayback = (force = false) => {
+      if (playbackFailed) return;
+      if (!sourceAttached && !force) return;
       playbackFailed = true;
       clearStallTimer();
+      clearStartupTimer();
       switchToSmootherSource(data);
     };
 
@@ -965,7 +987,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       theme: "#c6f36b",
       customType: {
         m3u8: (video, url, artInstance) =>
-          playM3u8(video, url, artInstance, failPlayback, () => {
+          playM3u8(video, url, artInstance, () => failPlayback(true), () => {
             sourceAttached = true;
           }),
       },
@@ -984,7 +1006,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     art.on("video:playing", () => {
       playbackFailed = false;
+      hasPlayed = true;
       clearStallTimer();
+      clearStartupTimer();
       if (status.classList.contains("loading")) setStatus("", "");
     });
     art.on("video:waiting", () => {
@@ -1003,10 +1027,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           readyState: current.readyState,
           paused: current.paused,
         }, "warn");
-        failPlayback();
+        failPlayback(true);
       }, 8000);
     });
     art.on("destroy", clearStallTimer);
+    art.on("destroy", clearStartupTimer);
     const activeArt = art;
     art.on("destroy", () => activeArt.hls?.destroy());
 
@@ -1048,7 +1073,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       setStatus("弹幕加载失败，播放不受影响。", "error");
     });
     art.on("video:error", () => {
-      failPlayback();
+      failPlayback(true);
     });
 
     art.on("video:ended", () => {
@@ -1062,6 +1087,28 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       }
       playNextEpisode();
     });
+
+    // 启动阶段兜底：自动播放被拦截、前置地址请求卡住或 HLS 未附着时，
+    // 允许主动尝试一次下一候选线路，避免一直停在 0 秒/加载中。
+    clearStartupTimer();
+    startupTimer = window.setTimeout(() => {
+      if (art !== activeArt || playbackFailed || hasPlayed) return;
+      const video = player.querySelector("video");
+      if (!video || video.currentTime <= 0.1) {
+        if (startupFallbackUsed) {
+          if (video?.paused) setStatus("请点击播放继续。", "");
+          return;
+        }
+        startupFallbackUsed = true;
+        devlog("启动超时", {
+          currentTime: Math.round((video?.currentTime || 0) * 10) / 10,
+          readyState: video?.readyState ?? "-",
+          paused: video?.paused ?? "-",
+          sourceAttached,
+        }, "warn");
+        failPlayback(true);
+      }
+    }, 10000);
 
     // 渲染选集栏
     renderEpisodes(currentMedia.episodes, currentMedia.episodeIndex);

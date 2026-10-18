@@ -12,9 +12,11 @@ import { log } from "./log.js";
 import { enrichMetadata } from "./metadata.js";
 import { normalizeVideoUrl, resolveStream } from "./provider.js";
 import { resolveWithBrowser } from "./providers/jx-browser.js";
+import { resolveBingdouWithBrowser } from "./providers/bingdou-browser.js";
+import { enabledHttpChannels, resolveHttpChannel } from "./providers/http.js";
 import { loadCatalogTitle, searchCatalog } from "./catalog.js";
 import { loadPageEpisodes, searchSites } from "./sites/index.js";
-import { openMedia } from "./media.js";
+import { assertPublicMediaUrl, openMedia } from "./media.js";
 import { extractExpiry, normalizeType, validateStream } from "./stream.js";
 
 const STATIC_FILES = new Map([
@@ -130,6 +132,17 @@ function sendMethodNotAllowed(res, allow) {
   );
 }
 
+async function readRequestBody(req, maxBytes = 16 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.byteLength;
+    if (size > maxBytes) throw new AppError("BAD_REQUEST", 400, "请求体过大");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function sendError(res, err, logger) {
   if (res.headersSent) {
     res.destroy();
@@ -153,6 +166,18 @@ function sendError(res, err, logger) {
   }
 
   sendJson(res, status, { ok: false, error: { code, message } });
+}
+
+async function mapLimited(items, limit, task) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await task(items[index]);
+    }
+  }));
+  return results;
 }
 
 async function sendStatic(req, res, entry, logger) {
@@ -190,7 +215,11 @@ async function sendStatic(req, res, entry, logger) {
 export function createServer({
   resolve = resolveStream,
   resolveBrowser = resolveWithBrowser,
+  httpChannels = enabledHttpChannels(config.httpProviderIds),
+  resolveHttp = resolveHttpChannel,
+  resolveBingdou = config.enableBrowserProvider ? resolveBingdouWithBrowser : null,
   validate = validateStream,
+  guardMedia = assertPublicMediaUrl,
   enrich = enrichMetadata,
   fetchDanmaku = fetchDmkuDanmaku,
   search = searchCatalog,
@@ -206,6 +235,7 @@ export function createServer({
 } = {}) {
   const parseCache = new Map();
   const danmakuCache = new Map();
+  const providerCooldowns = new Map();
 
   function getCached(cache, key) {
     const entry = cache.get(key);
@@ -217,7 +247,7 @@ export function createServer({
     return entry;
   }
 
-  function storeCached(cache, key, data, expiresAtMs) {
+  function storeCached(cache, key, data, expiresAtMs, candidates = []) {
     if (cacheMaxEntries <= 0 || cacheTtlMs <= 0) return;
     const current = now();
     const expiry = Math.min(
@@ -230,7 +260,7 @@ export function createServer({
       const oldest = cache.keys().next().value;
       if (oldest !== undefined) cache.delete(oldest);
     }
-    cache.set(key, { data, expiresAt: expiry });
+    cache.set(key, { data, candidates, expiresAt: expiry });
   }
 
   async function handleParse(res, requestUrl) {
@@ -241,43 +271,193 @@ export function createServer({
       return;
     }
 
-    const candidatePromises = [
-      resolve(sourceUrl).catch((err) => {
-        logger.warn("resolve.789_failed", { message: err?.message });
-        return null;
-      }),
-    ];
-
+    const resolvers = [{ id: "jiexi789", run: () => resolve(sourceUrl) }];
     if (config.enableBrowserProvider && resolveBrowser) {
-      candidatePromises.push(
-        resolveBrowser(sourceUrl, config.requestTimeoutMs).catch((err) => {
-          logger.warn("resolve.browser_failed", { message: err?.message });
-          return null;
+      resolvers.push({
+        id: "jx-browser",
+        run: () => resolveBrowser(sourceUrl, config.requestTimeoutMs),
+      });
+    }
+    for (const channel of httpChannels) {
+      resolvers.push({
+        id: channel.id,
+        fallback: channel.fallback === true,
+        run: () => resolveHttp(channel, sourceUrl, {
+          timeoutMs: config.httpProviderTimeoutMs,
+          resolveBrowserPage: resolveBingdou,
         }),
+      });
+    }
+    const seen = new Set();
+    const verified = [];
+    const diagnostics = [];
+    let resolvedCount = 0;
+    const runResolvers = (list) => mapLimited(list, list.length, async (item) => {
+      const startedAt = performance.now();
+      const diagnostic = { provider: item.id };
+      const finish = (status, extra = {}) => {
+        diagnostics.push({
+          ...diagnostic,
+          status,
+          ms: Math.round(performance.now() - startedAt),
+          ...extra,
+        });
+      };
+      if ((providerCooldowns.get(item.id) || 0) > now()) {
+        finish("cooldown");
+        return null;
+      }
+      let candidate;
+      try {
+        const result = await item.run();
+        providerCooldowns.delete(item.id);
+        if (!result) {
+          finish("empty");
+          return null;
+        }
+        diagnostic.playHost = hostOf(result.playUrl);
+        if (seen.has(result.playUrl)) {
+          finish("duplicate");
+          return null;
+        }
+        seen.add(result.playUrl);
+        resolvedCount += 1;
+        const type = normalizeType(result.type, result.playUrl);
+        if (result.singleUse) {
+          candidate = { ...result, type, stream: { playlist: null } };
+          verified.push(candidate);
+          finish("single-use", {
+            type: candidate.type,
+            available: true,
+            verified: false,
+            singleUse: true,
+            ttfbMs: null,
+            speedKBps: 0,
+          });
+          return {
+            candidate,
+            ranked: {
+              provider: candidate.provider,
+              playUrl: candidate.playUrl,
+              type: candidate.type,
+              speedKBps: 0,
+              ttfbMs: null,
+              score: 0,
+              available: true,
+              selected: false,
+              verified: false,
+              singleUse: true,
+            },
+          };
+        }
+        await guardMedia(result.playUrl);
+        const stream = await validate(result.playUrl, type);
+        candidate = { ...result, type, stream };
+        verified.push(candidate);
+      } catch (err) {
+        if (["UPSTREAM_ERROR", "UPSTREAM_TIMEOUT", "BROWSER_UNAVAILABLE", "BROWSER_ERROR"].includes(err?.code)) {
+          providerCooldowns.set(item.id, now() + 30_000);
+        }
+        finish("rejected", { code: err?.code, message: err?.message, detail: err?.detail });
+        logger.warn("stream.rejected", { provider: item.id, message: err?.message, detail: err?.detail });
+        return null;
+      }
+
+      let raceResult;
+      try {
+        raceResult = await race([candidate], {
+          probeSingle: true,
+          timeoutMs: config.benchmarkTimeoutMs,
+        });
+      } catch (err) {
+        logger.warn("benchmark.rejected", { provider: candidate.provider, message: err?.message });
+        raceResult = { winner: null, ranked: [] };
+      }
+      const single = raceResult?.ranked?.[0];
+      if (!raceResult?.winner || !single) {
+        finish("benchmark-rejected", {
+          type: candidate.type,
+          available: false,
+          verified: true,
+          singleUse: false,
+          ttfbMs: null,
+          speedKBps: 0,
+          message: "测速未通过",
+        });
+        logger.warn("benchmark.rejected", { provider: candidate.provider, message: "测速未通过" });
+        return {
+          candidate,
+          ranked: {
+            provider: candidate.provider,
+            playUrl: candidate.playUrl,
+            type: candidate.type,
+            speedKBps: 0,
+            ttfbMs: Infinity,
+            available: false,
+            selected: false,
+            score: 0,
+            verified: true,
+            singleUse: false,
+          },
+        };
+      }
+      finish("benchmarked", {
+        type: candidate.type,
+        available: single.available,
+        verified: true,
+        singleUse: false,
+        ttfbMs: single.ttfbMs,
+        speedKBps: single.speedKBps,
+        score: single.score,
+      });
+      return {
+        candidate: raceResult.winner,
+        ranked: { ...single, verified: true, singleUse: false },
+      };
+    }).then((items) => items.filter(Boolean));
+
+    const primary = resolvers.filter((item) => !item.fallback);
+    const fallback = resolvers.filter((item) => item.fallback);
+    let measured = await runResolvers(primary);
+    const hasVerifiedAvailable = measured.some((item) =>
+      item.ranked.available && item.ranked.verified);
+    if (fallback.length) {
+      if (hasVerifiedAvailable) {
+        for (const item of fallback) {
+          diagnostics.push({
+            provider: item.id,
+            status: "fallback-skipped",
+            ms: 0,
+            message: "已有可用已验证线路",
+          });
+        }
+      } else {
+        measured = measured.concat(await runResolvers(fallback));
+      }
+    }
+    if (!verified.length) {
+      throw new AppError(
+        resolvedCount ? "STREAM_INVALID" : "PARSE_FAILED",
+        502,
+        resolvedCount ? "所有解析线路均未返回可播放媒体" : "所有解析线路均未能解析该视频",
       );
     }
-
-    const resolvedCandidates = (await Promise.all(candidatePromises)).filter(
-      Boolean,
-    );
-    if (resolvedCandidates.length === 0) {
-      throw new AppError("PARSE_FAILED", 502, "所有解析线路均未能解析该视频");
+    const available = measured.filter((item) => item.ranked.available);
+    if (!available.length) {
+      throw new AppError("STREAM_INVALID", 502, "播放线路测速均未通过");
     }
-
-    const normalizedCandidates = resolvedCandidates.map((c) => ({
-      ...c,
-      type: normalizeType(c.type, c.playUrl),
+    measured.sort((a, b) =>
+      Number(b.ranked.available) - Number(a.ranked.available) ||
+      Number(b.ranked.verified) - Number(a.ranked.verified) ||
+      (b.ranked.score ?? 0) - (a.ranked.score ?? 0) ||
+      (a.ranked.ttfbMs ?? Infinity) - (b.ranked.ttfbMs ?? Infinity));
+    const winner = measured.find((item) => item.ranked.available);
+    const ranked = measured.map((item) => ({
+      ...item.ranked,
+      selected: item === winner && item.ranked.available,
     }));
-
-    const { winner, ranked } = await race(normalizedCandidates, {
-      timeoutMs: config.benchmarkTimeoutMs,
-    });
-
-    const selectedResult = winner || normalizedCandidates[0];
-    const stream =
-      (await validate(selectedResult.playUrl, selectedResult.type).catch(
-        () => ({}),
-      )) ?? {};
+    const selectedResult = winner.candidate;
+    const stream = selectedResult.stream;
     const info =
       (await enrich(selectedResult.sourceUrl, selectedResult.playUrl, stream)) ??
       {};
@@ -295,7 +475,10 @@ export function createServer({
         ? new Date(expiresAtMs).toISOString()
         : null,
       provider: selectedResult.provider,
+      singleUse: selectedResult.singleUse === true,
+      verified: selectedResult.singleUse !== true,
       candidates: ranked,
+      diagnostics,
       cached: false,
       danmaku: {
         provider: "dmku",
@@ -303,7 +486,8 @@ export function createServer({
       },
     };
 
-    storeCached(parseCache, sourceUrl, data, expiresAtMs);
+    storeCached(parseCache, sourceUrl, data, expiresAtMs,
+      verified.map(({ stream: _stream, ...candidate }) => candidate));
     logger.info("parse.selected", {
       pageHost: hostOf(sourceUrl),
       provider: data.provider,
@@ -316,6 +500,13 @@ export function createServer({
         ttfbMs: item.ttfbMs,
         available: item.available,
         selected: item.selected,
+        verified: item.verified,
+        singleUse: item.singleUse,
+      })),
+      diagnostics: diagnostics.map(({ provider, status, ms }) => ({
+        provider,
+        status,
+        ms,
       })),
     });
     sendJson(res, 200, { ok: true, data });
@@ -466,44 +657,80 @@ export function createServer({
     sendJson(res, 200, { ok: true, data });
   }
 
-  async function handleRace(req, res, requestUrl) {
-    let candidates = [];
-    if (req.method === "POST") {
-      const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
-      const raw = Buffer.concat(chunks).toString("utf8");
-      try {
-        const parsed = JSON.parse(raw);
-        candidates = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
-      } catch {
-        throw new AppError("BAD_REQUEST", 400, "无效的 JSON 请求体");
-      }
-    } else if (req.method === "GET") {
-      const sourcesParam = requestUrl.searchParams.get("sources");
-      if (sourcesParam) {
-        try {
-          candidates = JSON.parse(sourcesParam);
-        } catch {
-          throw new AppError("BAD_REQUEST", 400, "无效的 sources 参数");
-        }
-      }
-    } else {
-      sendMethodNotAllowed(res, "GET, POST");
+  async function handleRace(req, res) {
+    if (req.method !== "POST") {
+      sendMethodNotAllowed(res, "POST");
       return;
     }
-
-    if (!Array.isArray(candidates) || candidates.length === 0) {
-      throw new AppError("BAD_REQUEST", 400, "缺少候选流地址列表");
+    const raw = await readRequestBody(req);
+    let body;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      throw new AppError("BAD_REQUEST", 400, "无效的 JSON 请求体");
     }
-
-    const raceResult = await race(candidates, {
-      probeSingle: true,
-      timeoutMs: config.benchmarkTimeoutMs,
-    });
-    const ranked = raceResult?.ranked ?? [];
-    const selected =
+    const sourceUrl = normalizeVideoUrl(body?.sourceUrl);
+    const entry = getCached(parseCache, sourceUrl);
+    if (!entry) {
+      throw new AppError("PARSE_EXPIRED", 409, "播放线路已过期，请重新解析");
+    }
+    const excluded = Array.isArray(body.failedPlayUrls) ? body.failedPlayUrls : [];
+    if (excluded.length > 20 || excluded.some((value) => typeof value !== "string")) {
+      throw new AppError("BAD_REQUEST", 400, "无效的失败线路列表");
+    }
+    const allCandidates = entry.candidates;
+    const filtered = {
+      total: allCandidates.length,
+      excluded: allCandidates.filter((item) => excluded.includes(item.playUrl)).length,
+      expired: allCandidates.filter((item) =>
+        Number.isFinite(item.expiresAtMs) && item.expiresAtMs <= now()).length,
+      remaining: 0,
+    };
+    const candidates = allCandidates.filter((item) =>
+      !excluded.includes(item.playUrl) &&
+      (!Number.isFinite(item.expiresAtMs) || item.expiresAtMs > now()));
+    filtered.remaining = candidates.length;
+    if (!candidates.length) {
+      sendJson(res, 200, {
+        ok: true,
+        data: { selected: null, candidates: [], filtered },
+      });
+      return;
+    }
+    const verifiedCandidates = candidates.filter((item) => !item.singleUse);
+    const singleUseCandidates = candidates.filter((item) => item.singleUse);
+    let ranked = [];
+    if (verifiedCandidates.length) {
+      try {
+        const raceResult = await race(verifiedCandidates, {
+          probeSingle: true,
+          timeoutMs: config.benchmarkTimeoutMs,
+        });
+        ranked = raceResult?.ranked ?? [];
+      } catch (err) {
+        logger.warn("race.failed", { message: err?.message });
+      }
+    }
+    const verifiedSelected =
       ranked.find((c) => c.selected && c.available !== false) ?? null;
-    sendJson(res, 200, { ok: true, data: { selected, candidates: ranked } });
+    const singleUseRanked = singleUseCandidates.map((item, index) => ({
+      provider: item.provider,
+      playUrl: item.playUrl,
+      type: item.type,
+      speedKBps: 0,
+      ttfbMs: null,
+      score: 0,
+      available: true,
+      selected: !verifiedSelected && index === 0,
+      verified: false,
+      singleUse: true,
+    }));
+    const selected =
+      verifiedSelected ?? singleUseRanked.find((item) => item.selected) ?? null;
+    sendJson(res, 200, {
+      ok: true,
+      data: { selected, candidates: [...ranked, ...singleUseRanked], filtered },
+    });
   }
 
   return http.createServer(async (req, res) => {

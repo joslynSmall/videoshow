@@ -461,25 +461,110 @@ input {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
   margin-bottom: 10px;
 }
 
 .episodes-title-group {
+  flex: 1 1 auto;
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 .episodes-label {
+  flex: none;
   font-size: 13px;
   font-weight: 650;
   color: var(--text);
 }
 
 .episodes-current {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 12px;
   color: var(--accent);
   font-family: var(--mono);
+}
+
+.episodes-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.autoplay-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.autoplay-toggle[hidden] {
+  display: none;
+}
+
+.autoplay-toggle input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.switch-track {
+  position: relative;
+  flex: none;
+  width: 30px;
+  height: 17px;
+  border-radius: 999px;
+  background: var(--line-strong);
+  transition: background 0.15s ease;
+}
+
+.switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #879187;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.autoplay-toggle input:checked + .switch-track {
+  background: var(--accent);
+}
+
+.autoplay-toggle input:checked + .switch-track::after {
+  transform: translateX(13px);
+  background: var(--accent-ink);
+}
+
+.autoplay-toggle input:checked ~ .switch-text {
+  color: var(--text);
+}
+
+.autoplay-toggle input:focus-visible + .switch-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.autoplay-toggle:hover .switch-text {
+  color: var(--text);
 }
 
 .mini-button {
@@ -501,6 +586,12 @@ input {
 
 .episodes-scroll::-webkit-scrollbar {
   display: none;
+}
+
+.episodes-scroll .episode-btn {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .episode-btn {
@@ -832,14 +923,32 @@ input {
 .episodes-grid {
   padding: 16px;
   overflow-y: auto;
+  overflow-x: hidden;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
   gap: 8px;
+  align-content: start;
 }
 
 .episodes-grid .episode-btn {
-  min-width: unset;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 40px;
+  padding: 4px 8px;
+  white-space: normal;
   text-align: center;
+}
+
+.episode-btn-label {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  line-height: 1.3;
 }
 
 .footer {
@@ -956,6 +1065,16 @@ input {
     margin-top: 32px;
   }
 
+  .episodes-actions {
+    margin-left: auto;
+  }
+
+  .episodes-grid {
+    grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+    padding: 12px;
+    gap: 6px;
+  }
+
   /* 移动端模态框自动转为底部半屏抽屉交互 */
   .modal-backdrop {
     padding: 0;
@@ -1028,5 +1147,138 @@ input {
     bottom: 20px;
     width: 40px;
     height: 40px;
+  }
+}
+
+/* 开发日志：渠道选择与自动换线 */
+.devlog {
+  position: fixed;
+  left: 16px;
+  bottom: 18px;
+  z-index: 95;
+  max-width: min(560px, calc(100vw - 32px));
+  color: var(--muted);
+  font: 11px/1.45 var(--mono);
+}
+
+.devlog > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  opacity: 0.45;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.devlog > summary::-webkit-details-marker {
+  display: none;
+}
+
+.devlog:hover > summary,
+.devlog[open] > summary {
+  opacity: 1;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.devlog[open] > summary {
+  border-radius: 8px 8px 0 0;
+}
+
+#devlog-count:not([hidden]) {
+  color: var(--accent);
+}
+
+.devlog-panel {
+  width: min(560px, calc(100vw - 32px));
+  max-height: 44vh;
+  overflow: auto;
+  padding: 8px 10px 10px;
+  border: 1px solid var(--line-strong);
+  border-top: 0;
+  border-radius: 0 10px 10px 10px;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(8px);
+}
+
+.devlog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.devlog-head button {
+  padding: 1px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.devlog-head button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.devlog-list {
+  display: grid;
+  gap: 3px;
+  margin: 7px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.devlog-item {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.devlog-item .t {
+  color: #68756b;
+}
+
+.devlog-item .e {
+  margin-left: 6px;
+  color: var(--accent);
+}
+
+.devlog-item .d {
+  color: var(--muted);
+}
+
+.devlog-item.is-warn .e {
+  color: #f0b45a;
+}
+
+.devlog-item.is-error .e {
+  color: var(--danger);
+}
+
+@media (max-width: 640px) {
+  .devlog {
+    left: 12px;
+    right: 12px;
+    bottom: 14px;
+    max-width: none;
+  }
+
+  .devlog-panel {
+    width: 100%;
+    max-height: 38vh;
   }
 }

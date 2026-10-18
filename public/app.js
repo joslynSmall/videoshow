@@ -63,12 +63,174 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   const closeEpisodesBtn = document.querySelector("#close-episodes-button");
   const episodesGrid = document.querySelector("#episodes-grid");
   const episodesModalTitle = document.querySelector("#episodes-modal-title");
+  const PLAYBACK_RATES = [0.5, 0.8, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2, 2.5, 3];
+  const autoplayNextInput = document.querySelector("#autoplay-next");
+  const autoplayToggle = autoplayNextInput?.closest(".autoplay-toggle");
+  const AUTOPLAY_NEXT_KEY = "videoshow_autoplay_next_v1";
 
   let art = null;
   let currentMedia = null; // 当前播放的完整上下文信息
   let progressSaveTimer = 0;
   let stallTimer = 0;
   let switchingLine = false;
+
+  const devlogEl = document.querySelector("#devlog");
+  const devlogList = document.querySelector("#devlog-list");
+  const devlogCount = document.querySelector("#devlog-count");
+  const devlogClear = document.querySelector("#devlog-clear");
+  const DEVLOG_LIMIT = 200;
+  const devlogEntries = [];
+
+  function devlogValue(value) {
+    if (value === null || value === undefined || value === "") return "-";
+    if (typeof value === "number") return Number.isFinite(value) ? String(value) : "-";
+    if (typeof value === "boolean") return value ? "yes" : "no";
+    if (Array.isArray(value)) return value.map(devlogValue).join(",");
+    if (typeof value === "object") {
+      return Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => `${key}=${devlogValue(item)}`)
+        .join(" ");
+    }
+    return String(value);
+  }
+
+  function renderDevlog() {
+    if (!devlogList) return;
+    const fragment = document.createDocumentFragment();
+    for (const entry of devlogEntries) {
+      const item = document.createElement("li");
+      item.className = `devlog-item${entry.level === "warn" ? " is-warn" : entry.level === "error" ? " is-error" : ""}`;
+      const time = document.createElement("span");
+      time.className = "t";
+      time.textContent = entry.time;
+      const event = document.createElement("span");
+      event.className = "e";
+      event.textContent = entry.event;
+      const detail = document.createElement("span");
+      detail.className = "d";
+      detail.textContent = entry.detail ? ` ${entry.detail}` : "";
+      item.append(time, event, detail);
+      fragment.append(item);
+    }
+    devlogList.replaceChildren(fragment);
+    if (devlogCount) {
+      devlogCount.textContent = String(devlogEntries.length);
+      devlogCount.hidden = devlogEntries.length === 0;
+    }
+    if (devlogEl?.open) {
+      const panel = devlogEl.querySelector(".devlog-panel");
+      if (panel) panel.scrollTop = panel.scrollHeight;
+    }
+  }
+
+  function devlog(event, detail = "", level = "info") {
+    devlogEntries.push({
+      time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+      event,
+      detail: typeof detail === "string" ? detail : devlogValue(detail),
+      level,
+    });
+    if (devlogEntries.length > DEVLOG_LIMIT) devlogEntries.shift();
+    renderDevlog();
+  }
+
+  function devlogCandidates(label, candidates) {
+    for (const item of candidates || []) {
+      devlog(label, {
+        provider: item.provider,
+        available: item.available,
+        verified: item.verified,
+        singleUse: item.singleUse,
+        ttfbMs: item.ttfbMs ?? "-",
+        speedKBps: item.speedKBps ?? "-",
+        score: item.score ?? "-",
+        selected: item.selected,
+        host: hostOf(item.playUrl),
+      }, item.available === false ? "warn" : "info");
+    }
+  }
+
+  function devlogLatencyRanking(data) {
+    const candidates = new Map((data.candidates || []).map((item) => [item.provider, item]));
+    const rows = (data.diagnostics || []).map((item) => {
+      const candidate = candidates.get(item.provider);
+      return {
+        provider: item.provider,
+        status: item.status,
+        resolveMs: item.ms,
+        ttfbMs: item.ttfbMs ?? candidate?.ttfbMs ?? null,
+        speedKBps: item.speedKBps ?? candidate?.speedKBps ?? null,
+        score: item.score ?? candidate?.score ?? null,
+        selected: candidate?.selected === true,
+        code: item.code,
+        message: item.message,
+        detail: item.detail,
+      };
+    });
+    if (!rows.length) return;
+    const group = (item) => {
+      if (item.status === "benchmarked") return 0;
+      if (item.status === "single-use") return 1;
+      if (item.status === "rejected" || item.status === "benchmark-rejected") return 2;
+      return 3;
+    };
+    rows.sort((a, b) =>
+      group(a) - group(b) ||
+      (group(a) === 0
+        ? (a.ttfbMs ?? Infinity) - (b.ttfbMs ?? Infinity) ||
+          (b.speedKBps ?? 0) - (a.speedKBps ?? 0)
+        : (a.resolveMs ?? Infinity) - (b.resolveMs ?? Infinity)));
+    const lines = rows.map((item, index) => {
+      const parts = [
+        `${index + 1}. ${item.provider}`,
+        `status=${item.status}`,
+        `解析耗时=${item.resolveMs ?? "-"}ms`,
+      ];
+      if (item.status === "benchmarked") {
+        parts.push(
+          `TTFB=${item.ttfbMs ?? "-"}ms`,
+          `速度=${item.speedKBps ?? "-"}KB/s`,
+          `score=${item.score ?? "-"}`,
+        );
+      } else if (item.status === "single-use") {
+        parts.push("TTFB=未测速", "速度=未测速");
+      } else if (item.code || item.message) {
+        parts.push(`error=${[item.code, item.message].filter(Boolean).join(":")}`);
+        if (item.detail) parts.push(`detail=${devlogValue(item.detail)}`);
+      }
+      if (item.selected) parts.push("selected");
+      return parts.join(" ");
+    });
+    devlog(
+      "渠道延迟排行",
+      "\n排序：已验证按 TTFB 升序，单次链接/失败按解析耗时\n" + lines.join("\n"),
+      "info",
+    );
+  }
+
+  if (devlogClear) {
+    devlogClear.addEventListener("click", () => {
+      devlogEntries.length = 0;
+      renderDevlog();
+    });
+  }
+
+  devlog("初始化", "选择规则：可用优先 > 已验证优先 > score 高 > TTFB 低；冰豆仅在无可用主线路时回退");
+
+  if (autoplayNextInput) {
+    try {
+      autoplayNextInput.checked = localStorage.getItem(AUTOPLAY_NEXT_KEY) !== "0";
+    } catch {
+      autoplayNextInput.checked = true;
+    }
+    autoplayNextInput.addEventListener("change", () => {
+      try {
+        localStorage.setItem(AUTOPLAY_NEXT_KEY, autoplayNextInput.checked ? "1" : "0");
+      } catch {}
+      devlog("自动下一集", { enabled: autoplayNextInput.checked }, "info");
+    });
+  }
 
   function clearStallTimer() {
     if (!stallTimer) return;
@@ -318,7 +480,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   function playM3u8(video, url, artInstance, onFatal, onAttached) {
     const tried = new Set();
     const retry = { maxNumRetry: 2, retryDelayMs: 300, maxRetryDelayMs: 1000 };
+    artInstance.activeHlsUrl = url;
+    artInstance.hls?.destroy();
+    artInstance.hls = null;
     const startHls = (source) => {
+      if (artInstance.activeHlsUrl !== url) return;
       onAttached?.();
       if (!window.Hls?.isSupported()) {
         if (video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -417,11 +583,27 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           },
         },
       });
+      artInstance.hls = hls;
       hls.loadSource(source);
       hls.attachMedia(video);
       hls.on(window.Hls.Events.ERROR, (_event, detail) => {
-        if (!detail?.fatal) return;
+        if (artInstance.hls !== hls || artInstance.activeHlsUrl !== url) return;
+        if (!detail?.fatal) {
+          if (detail?.type === "networkError") {
+            devlog("HLS 网络错误", {
+              details: detail.details,
+              host: hostOf(url),
+            }, "warn");
+          }
+          return;
+        }
+        devlog("HLS 致命错误", {
+          type: detail.type,
+          details: detail.details,
+          host: hostOf(url),
+        }, "error");
         hls.destroy();
+        artInstance.hls = null;
         if (tried.has(source)) {
           onFatal?.();
           return;
@@ -437,10 +619,15 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           })
           .catch(() => onFatal?.());
       });
-      artInstance.once("destroy", () => hls.destroy());
     };
 
     const useRecovered = (recovered) => {
+      if (artInstance.activeHlsUrl !== url) return;
+      devlog("HLS 自动恢复", {
+        fromHost: hostOf(url),
+        toHost: hostOf(recovered.playUrl),
+        provider: recovered.provider || "-",
+      }, "warn");
       reportPlayback("playback.recover", {
         fromHost: hostOf(url),
         toHost: hostOf(recovered.playUrl),
@@ -487,7 +674,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return title.replace(/(\s+第\d+集|\s+全集|\s+正片)+/gi, "").trim() || title;
   }
 
-  async function pickFasterSource(candidates) {
+  async function pickFasterSource(sourceUrl, failedPlayUrls, refreshed = false) {
+    devlog("重新测速", { excluded: failedPlayUrls.length, refreshed }, "info");
     try {
       const response = await fetch("/api/race", {
         method: "POST",
@@ -495,64 +683,138 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           "content-type": "application/json",
           accept: "application/json",
         },
-        body: JSON.stringify({ candidates }),
+        body: JSON.stringify({ sourceUrl, failedPlayUrls }),
       });
       const payload = await response.json();
+      const candidates = payload?.data?.candidates || [];
       const selected = payload?.data?.selected;
+      devlog("race 响应", {
+        status: response.status,
+        selected: selected?.provider || "none",
+        host: hostOf(selected?.playUrl),
+        available: candidates.filter((item) => item.available !== false).length,
+        total: candidates.length,
+        filtered: payload?.data?.filtered,
+      }, selected ? "info" : "warn");
+      devlogCandidates("race 候选", candidates);
+      const raceRanked = [...candidates].sort((a, b) =>
+        Number(b.available !== false) - Number(a.available !== false) ||
+        (b.score ?? 0) - (a.score ?? 0) ||
+        (a.ttfbMs ?? Infinity) - (b.ttfbMs ?? Infinity));
+      if (raceRanked.length) {
+        devlog("race 排行", "\n" + raceRanked.map((item, index) => {
+          const flags = [item.selected ? "selected" : "", item.singleUse ? "singleUse" : ""]
+            .filter(Boolean).join(" ");
+          return `${index + 1}. ${item.provider} TTFB=${item.ttfbMs ?? "-"}ms 速度=${item.speedKBps ?? "-"}KB/s score=${item.score ?? "-"}${flags ? ` ${flags}` : ""}`;
+        }).join("\n"), "info");
+      }
+      if (response.status === 409 && !refreshed) {
+        devlog("race 缓存过期", "重新解析后重试", "warn");
+        await parse(sourceUrl);
+        return pickFasterSource(sourceUrl, failedPlayUrls, true);
+      }
       if (response.ok && selected?.playUrl && selected.available !== false) return selected;
+      if (response.ok && !selected && !refreshed) {
+        devlog("race 无候选", "重新解析以刷新单次签名地址", "warn");
+        try {
+          await parse(sourceUrl);
+        } catch (err) {
+          devlog("重新解析失败", err instanceof Error ? err.message : String(err), "error");
+          return null;
+        }
+        return pickFasterSource(sourceUrl, failedPlayUrls, true);
+      }
+      devlog("race 无可用候选", {
+        status: response.status,
+        filtered: payload?.data?.filtered,
+      }, "warn");
     } catch (err) {
+      devlog("race 失败", err instanceof Error ? err.message : String(err), "error");
       console.warn("重新测速失败", err);
     }
-    return candidates.find((item) => item.playUrl && item.available !== false) || null;
+    return null;
   }
 
   async function switchToSmootherSource(data) {
-    if (switchingLine) return;
-    const video = player.querySelector("video");
-    const continueAt = video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    if (switchingLine || !art) {
+      devlog("换线跳过", switchingLine ? "已有换线进行中" : "播放器不存在", "warn");
+      return;
+    }
+    const instance = art;
+    const continueAt = Number.isFinite(instance.currentTime) ? instance.currentTime : 0;
     const failed = new Set(Array.isArray(data.failedPlayUrls) ? data.failedPlayUrls : []);
     if (data.playUrl) failed.add(data.playUrl);
-    const pool = (data.candidates || []).filter((item) => item.playUrl && !failed.has(item.playUrl));
-    if (!pool.length) {
+    switchingLine = true;
+    clearStallTimer();
+    setStatus("播放不够流畅，正在更换线路…", "loading");
+    devlog("触发换线", {
+      from: data.provider || "-",
+      fromHost: hostOf(data.playUrl),
+      continueAt: Math.round(continueAt),
+      failed: failed.size,
+    }, "warn");
+    try {
+      for (let attempts = 0; attempts < 8; attempts += 1) {
+        devlog("换线尝试", { attempt: attempts + 1, excluded: failed.size }, "info");
+        const chosen = await pickFasterSource(data.sourceUrl, [...failed]);
+        if (art !== instance) {
+          devlog("换线中止", "播放器已重建", "warn");
+          return;
+        }
+        if (!chosen?.playUrl || failed.has(chosen.playUrl)) {
+          devlog("换线结束", chosen?.playUrl ? "候选已被标记失败" : "没有可用候选", "warn");
+          break;
+        }
+        devlog("切换线路", {
+          from: data.provider || "-",
+          to: chosen.provider || "-",
+          fromHost: hostOf(data.playUrl),
+          toHost: hostOf(chosen.playUrl),
+          type: chosen.type,
+          singleUse: chosen.singleUse === true,
+          ttfbMs: chosen.ttfbMs ?? "-",
+          speedKBps: chosen.speedKBps ?? "-",
+        }, "warn");
+        failed.add(chosen.playUrl);
+        try {
+          instance.activeHlsUrl = null;
+          instance.hls?.destroy();
+          instance.hls = null;
+          instance.type = chosen.type;
+          await instance.switchQuality(chosen.playUrl);
+          if (art !== instance) return;
+          reportPlayback("playback.switch", {
+            fromHost: hostOf(data.playUrl),
+            toHost: hostOf(chosen.playUrl),
+            episode: data.episodeName || "",
+            continueAt,
+          });
+          devlog("换线成功", {
+            provider: chosen.provider || "-",
+            host: hostOf(chosen.playUrl),
+            at: Math.round(continueAt),
+          }, "info");
+          data.playUrl = chosen.playUrl;
+          data.type = chosen.type;
+          data.failedPlayUrls = [...failed].filter((url) => url !== chosen.playUrl);
+          if (currentMedia) {
+            currentMedia.playUrl = chosen.playUrl;
+            currentMedia.type = chosen.type;
+          }
+          setStatus("", "");
+          return;
+        } catch (err) {
+          devlog("换线失败", err instanceof Error ? err.message : String(err), "error");
+          console.warn("线路切换失败", err);
+        }
+      }
       reportPlayback("playback.failed", {
         playHost: hostOf(data.playUrl),
         episode: data.episodeName || "",
         reason: "no-alternative",
       });
+      devlog("换线结束", "没有可用备用线路", "error");
       setStatus("暂时播不了，请稍后再试。", "error");
-      return;
-    }
-    switchingLine = true;
-    clearStallTimer();
-    setStatus("播放不够流畅，正在更换线路…", "loading");
-    try {
-      const chosen = await pickFasterSource(pool);
-      if (!chosen?.playUrl) {
-        reportPlayback("playback.failed", {
-          playHost: hostOf(data.playUrl),
-          episode: data.episodeName || "",
-          reason: "race-empty",
-        });
-        setStatus("暂时播不了，请稍后再试。", "error");
-        return;
-      }
-      reportPlayback("playback.switch", {
-        fromHost: hostOf(data.playUrl),
-        toHost: hostOf(chosen.playUrl),
-        episode: data.episodeName || "",
-        continueAt,
-      });
-      showResult({
-        ...data,
-        playUrl: chosen.playUrl,
-        type: chosen.type || (/\.mp4(\?|$)/i.test(chosen.playUrl) ? "mp4" : "m3u8"),
-        continueAt,
-        failedPlayUrls: [...failed],
-        candidates: (data.candidates || []).map((item) => ({
-          ...item,
-          selected: item.playUrl === chosen.playUrl,
-        })),
-      });
     } finally {
       switchingLine = false;
     }
@@ -567,6 +829,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   function reportPlayback(event, fields) {
+    devlog("播放事件", { event, ...fields }, event === "playback.failed" ? "error" : "info");
     fetch("/api/client-log", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -576,6 +839,41 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   function showResult(data) {
     clearStallTimer();
+    devlog("解析结果", {
+      provider: data.provider || "-",
+      type: data.type || "-",
+      host: hostOf(data.playUrl),
+      singleUse: data.singleUse === true,
+      verified: data.verified !== false,
+      cached: data.cached === true,
+    }, data.singleUse ? "warn" : "info");
+    for (const item of data.diagnostics || []) {
+      devlog("渠道诊断", {
+        provider: item.provider,
+        status: item.status,
+        ms: item.ms,
+        code: item.code,
+        message: item.message,
+        detail: item.detail,
+        ttfbMs: item.ttfbMs ?? "-",
+        speedKBps: item.speedKBps ?? "-",
+        host: item.playHost,
+      }, item.status === "rejected" || item.status === "benchmark-rejected" ? "warn" : "info");
+    }
+    devlogLatencyRanking(data);
+    devlogCandidates("候选线路", data.candidates);
+    const selectedCandidate = (data.candidates || []).find((item) => item.selected);
+    if (selectedCandidate) {
+      devlog("选择依据", {
+        rule: data.singleUse
+          ? "无已验证线路，使用单次签名链接"
+          : "可用优先 > 已验证优先 > score 高 > TTFB 低",
+        provider: selectedCandidate.provider,
+        ttfbMs: selectedCandidate.ttfbMs ?? "-",
+        speedKBps: selectedCandidate.speedKBps ?? "-",
+        score: selectedCandidate.score ?? "-",
+      }, "info");
+    }
     const baseTitle = data.baseTitle || currentMedia?.baseTitle || cleanBaseTitle(data.title);
     const displayTitle = data.episodeName ? `${baseTitle} ${data.episodeName}` : (data.title || baseTitle);
 
@@ -624,7 +922,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     const danmakuEndpoint = data.danmaku?.endpoint || "";
     let playbackFailed = false;
-    let sourceAttached = false;
+    let sourceAttached = data.type !== "m3u8";
     const failPlayback = () => {
       if (!sourceAttached || playbackFailed) return;
       playbackFailed = true;
@@ -632,6 +930,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       switchToSmootherSource(data);
     };
 
+    window.Artplayer.PLAYBACK_RATE = PLAYBACK_RATES;
     art = new window.Artplayer({
       container: player,
       url: data.playUrl,
@@ -658,7 +957,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           danmuku: () => loadDanmaku(danmakuEndpoint),
           emitter: false,
           theme: "dark",
-          fontSize: 25,
+          fontSize: 20,
           speed: 5,
           opacity: 1,
           antiOverlap: true,
@@ -667,6 +966,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     });
 
     art.on("video:playing", () => {
+      playbackFailed = false;
       clearStallTimer();
       if (status.classList.contains("loading")) setStatus("", "");
     });
@@ -674,11 +974,24 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       clearStallTimer();
       stallTimer = window.setTimeout(() => {
         const current = player.querySelector("video");
-        if (!current || current.paused || current.readyState >= 3) return;
+        if (!current || current.paused || current.readyState >= 3) {
+          devlog("卡顿恢复", {
+            currentTime: Math.round(current?.currentTime || 0),
+            readyState: current?.readyState ?? "-",
+          }, "info");
+          return;
+        }
+        devlog("卡顿超时", {
+          currentTime: Math.round(current.currentTime),
+          readyState: current.readyState,
+          paused: current.paused,
+        }, "warn");
         failPlayback();
       }, 8000);
     });
     art.on("destroy", clearStallTimer);
+    const activeArt = art;
+    art.on("destroy", () => activeArt.hls?.destroy());
 
     art.on("ready", () => {
       if (resumeTime > 0) {
@@ -719,6 +1032,18 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     });
     art.on("video:error", () => {
       failPlayback();
+    });
+
+    art.on("video:ended", () => {
+      if (art !== activeArt) return;
+      if (currentMedia && Number.isFinite(art.duration) && art.duration > 0) {
+        HistoryStore.save({
+          ...currentMedia,
+          currentTime: art.currentTime,
+          duration: art.duration,
+        });
+      }
+      playNextEpisode();
     });
 
     // 渲染选集栏
@@ -792,8 +1117,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     }
 
     episodesBar.hidden = false;
+    if (autoplayToggle) autoplayToggle.hidden = !showEpisodes;
     renderPlatforms(platforms, currentMedia?.platformId);
-    currentEpisodeText.textContent = episodes[activeIndex]?.name || `第 ${activeIndex + 1} 集`;
+    currentEpisodeText.textContent = episodes?.[activeIndex]?.name || `第 ${activeIndex + 1} 集`;
     if (!showEpisodes) {
       episodesScroll.innerHTML = "";
       episodesGrid.innerHTML = "";
@@ -818,7 +1144,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       const gridBtn = document.createElement("button");
       gridBtn.type = "button";
       gridBtn.className = "episode-btn" + (idx === activeIndex ? " is-active" : "");
-      gridBtn.textContent = ep.name || `${idx + 1}`;
+      const gridLabel = document.createElement("span");
+      gridLabel.className = "episode-btn-label";
+      gridLabel.textContent = ep.name || `${idx + 1}`;
+      gridBtn.appendChild(gridLabel);
       gridBtn.addEventListener("click", () => {
         episodesModal.hidden = true;
         selectEpisode(ep, idx);
@@ -827,6 +1156,31 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     });
 
     requestAnimationFrame(() => placeActiveEpisode(activeIndex));
+  }
+
+  let autoNextPending = false;
+
+  function playNextEpisode() {
+    if (!autoplayNextInput?.checked || autoNextPending || switchingLine) return;
+    const episodes = currentMedia?.episodes;
+    const index = currentMedia?.episodeIndex;
+    if (!Array.isArray(episodes) || !Number.isInteger(index)) return;
+    const next = episodes[index + 1];
+    if (!next?.pageUrl) return;
+
+    autoNextPending = true;
+    devlog("自动下一集", {
+      from: currentMedia.episodeName || `第 ${index + 1} 集`,
+      to: next.name || `第 ${index + 2} 集`,
+    }, "info");
+    setStatus(`播放结束，正在自动播放${next.name || "下一集"}…`, "loading");
+    selectEpisode(next, index + 1)
+      .catch((err) => {
+        setStatus(err instanceof Error ? err.message : "解析失败，请稍后重试。", "error");
+      })
+      .finally(() => {
+        autoNextPending = false;
+      });
   }
 
   async function selectEpisode(episode, index) {
@@ -1177,6 +1531,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   async function parse(url) {
+    devlog("解析请求", { host: hostOf(url) }, "info");
     const response = await fetch(`/api/parse?url=${encodeURIComponent(url)}`, {
       headers: { accept: "application/json" },
     });
@@ -1191,9 +1546,20 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (!response.ok || !payload || payload.ok !== true) {
       const message =
         payload?.error?.message || `解析失败（HTTP ${response.status}）`;
+      devlog("解析失败", {
+        status: response.status,
+        code: payload?.error?.code,
+        message,
+      }, "error");
       throw new Error(message);
     }
 
+    devlog("解析响应", {
+      status: response.status,
+      provider: payload?.data?.provider,
+      candidates: payload?.data?.candidates?.length || 0,
+      diagnostics: payload?.data?.diagnostics?.length || 0,
+    }, "info");
     return payload.data;
   }
 

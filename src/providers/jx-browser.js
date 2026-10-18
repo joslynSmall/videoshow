@@ -6,6 +6,10 @@ import { log } from "../log.js";
 
 const CHROME_PATH = process.env.CHROME_BIN || "/usr/bin/google-chrome";
 
+export function inferPlaybackType(playUrl) {
+  return /\.mp4(\?|$)/i.test(playUrl) ? "mp4" : "m3u8";
+}
+
 export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
   if (!fs.existsSync(CHROME_PATH)) {
     throw new AppError("BROWSER_UNAVAILABLE", 503, "无头 Chrome 未安装");
@@ -154,7 +158,7 @@ export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
     return {
       sourceUrl,
       playUrl,
-      type: "m3u8",
+      type: inferPlaybackType(playUrl),
       expiresAtMs: Date.now() + 3600 * 1000,
       provider: "jx-browser",
     };

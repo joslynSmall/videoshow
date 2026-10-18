@@ -159,3 +159,35 @@ test("raceAndSelect ranks candidates by speed and score", async () => {
   assert.equal(result.ranked[1].provider, "slow-line");
   assert.equal(result.ranked[1].selected, false);
 });
+
+test("benchmarkStream stops reading once the sample limit is reached", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response(
+    new Uint8Array(1024 * 1024),
+    { status: 200, headers: { "content-type": "video/mp4" } },
+  ));
+  const result = await benchmarkStream("https://8.8.8.8/video.mp4", "mp4");
+  assert.equal(result.available, true);
+  assert.equal(result.bytes, 512 * 1024);
+});
+
+test("benchmarkStream rejects an HTML response masquerading as media", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response("<html></html>", {
+    status: 200,
+    headers: { "content-type": "text/html" },
+  }));
+  const result = await benchmarkStream("https://8.8.8.8/video.mp4", "mp4");
+  assert.equal(result.available, false);
+});
+
+test("benchmarkStream cancels failed playlist and media responses", async (t) => {
+  for (const type of ["m3u8", "mp4"]) {
+    let canceled = false;
+    const mock = t.mock.method(globalThis, "fetch", async () => new Response(new ReadableStream({
+      cancel() { canceled = true; },
+    }), { status: 404 }));
+    const result = await benchmarkStream(`https://8.8.8.8/video.${type}`, type);
+    assert.equal(result.available, false);
+    assert.equal(canceled, true);
+    mock.mock.restore();
+  }
+});

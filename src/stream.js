@@ -1,6 +1,55 @@
 import { config } from "./config.js";
 import { AppError } from "./errors.js";
-import { fetchText, probeUrl } from "./http.js";
+import { fetchPublicMedia } from "./media.js";
+
+async function readPlaylist(url, { timeoutMs }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchPublicMedia(url, { signal: controller.signal });
+    if (!response.ok || !response.body) {
+      await response.body?.cancel().catch(() => {});
+      throw new AppError("STREAM_INVALID", 502, "播放清单不可访问");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 1024 * 1024) throw new AppError("STREAM_INVALID", 502, "播放清单过大");
+        text += decoder.decode(value, { stream: true });
+      }
+      return text + decoder.decode();
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeMedia(url, { method, headers, timeoutMs }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchPublicMedia(url, {
+      method, headers, signal: controller.signal,
+    });
+    const result = {
+      status: response.status,
+      contentType: response.headers.get("content-type") || "",
+      contentRange: response.headers.get("content-range") || "",
+    };
+    await response.body?.cancel?.().catch(() => {});
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export function normalizeType(type, playUrl) {
   const raw = String(type || "").trim().toLowerCase();
@@ -29,7 +78,7 @@ export function extractExpiry(playUrl) {
 export async function validateStream(
   playUrl,
   type,
-  { textFetcher = fetchText, prober = probeUrl } = {},
+  { textFetcher = readPlaylist, prober = probeMedia } = {},
 ) {
   if (type === "m3u8") {
     const playlist = await textFetcher(playUrl, {
@@ -47,14 +96,16 @@ export async function validateStream(
     method: "HEAD",
     timeoutMs: config.streamTimeoutMs,
   });
-  if (probe.status >= 400) {
+  if (probe.status >= 400 || !/^(video\/mp4|application\/octet-stream)\b/i.test(probe.contentType || "")) {
     probe = await prober(playUrl, {
       method: "GET",
       headers: { range: "bytes=0-0" },
       timeoutMs: config.streamTimeoutMs,
     });
   }
-  if (probe.status >= 400) {
+  if (probe.status >= 400 ||
+      (!/^(video\/mp4|application\/octet-stream)\b/i.test(probe.contentType || "") &&
+       !(probe.status === 206 && /^bytes \d+-\d+\/\d+/i.test(probe.contentRange || "")))) {
     throw new AppError("STREAM_INVALID", 502, "播放地址不可用，请重新解析");
   }
   return { playlist: null };

@@ -85,7 +85,14 @@
               <span class="episodes-label">选集</span>
               <span id="current-episode-text" class="episodes-current"></span>
             </div>
-            <button id="all-episodes-button" type="button" class="ghost-button mini-button">全集</button>
+            <div class="episodes-actions">
+              <label class="autoplay-toggle" title="播放结束后自动播放下一集">
+                <input id="autoplay-next" type="checkbox" checked>
+                <span class="switch-track" aria-hidden="true"></span>
+                <span class="switch-text">自动下一集</span>
+              </label>
+              <button id="all-episodes-button" type="button" class="ghost-button mini-button">全集</button>
+            </div>
           </div>
           <div id="episodes-scroll" class="episodes-scroll"></div>
         </div>
@@ -150,6 +157,17 @@
       <p>请仅解析你有权访问的内容。</p>
     </footer>
   </div>
+
+  <details id="devlog" class="devlog">
+    <summary class="devlog-toggle" title="开发日志：渠道选择与切换">DEV <span id="devlog-count" hidden>0</span></summary>
+    <div class="devlog-panel">
+      <div class="devlog-head">
+        <span>渠道选择 / 切换日志</span>
+        <button id="devlog-clear" type="button">清空</button>
+      </div>
+      <ol id="devlog-list" class="devlog-list" role="log" aria-live="polite"></ol>
+    </div>
+  </details>
 
   <noscript>
     <p class="noscript">需要启用 JavaScript 才能解析和播放。</p>

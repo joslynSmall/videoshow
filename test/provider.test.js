@@ -5,6 +5,7 @@ import {
   decryptPlayUrl,
   extractConfig,
   normalizeVideoUrl,
+  upstreamExpiry,
 } from "../src/provider.js";
 
 const CIPHER =
@@ -62,6 +63,15 @@ test("normalizeVideoUrl accepts arbitrary http(s) video URLs", () => {
     normalizeVideoUrl("https://v.youku.com/v_show/id_X.html"),
     "https://v.youku.com/v_show/id_X.html",
   );
+});
+
+test("upstreamExpiry distinguishes durations from absolute timestamps", () => {
+  const now = 1_700_000_000_000;
+  assert.equal(upstreamExpiry(18000, null, now), now + 18_000_000);
+  assert.equal(upstreamExpiry(1_792_328_146, null, now), 1_792_328_146_000);
+  assert.equal(upstreamExpiry(null, 60, now), now + 60_000);
+  assert.equal(upstreamExpiry(1_792_328_146_000, null, now), 1_792_328_146_000);
+  assert.equal(upstreamExpiry(0, 0, now), null);
 });
 
 test("normalizeVideoUrl rejects missing and non-http URLs", () => {

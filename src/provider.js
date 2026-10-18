@@ -89,6 +89,17 @@ export function decryptPlayUrl(ciphertext, key = config.aesKey, iv = config.aesI
   }
 }
 
+export function upstreamExpiry(expireTime, expiresIn, now = Date.now()) {
+  const toExpiry = (value) => {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    if (seconds > 1e12) return seconds;
+    if (seconds > 1e9) return seconds * 1000;
+    return now + seconds * 1000;
+  };
+  return toExpiry(expireTime) ?? toExpiry(expiresIn);
+}
+
 function upstreamFailure(err) {
   if (err instanceof AppError && err.code === "UPSTREAM_TIMEOUT") {
     return new AppError("UPSTREAM_TIMEOUT", 504, "解析服务响应超时，请稍后重试", {
@@ -102,12 +113,19 @@ function upstreamFailure(err) {
 
 export async function resolveStream(rawUrl) {
   const sourceUrl = normalizeVideoUrl(rawUrl);
+  return resolveJiexiUpstream(sourceUrl);
+}
 
-  const playerUrl = `${config.upstreamBase}/jiexi.php?url=${encodeURIComponent(sourceUrl)}`;
+export async function resolveJiexiUpstream(
+  sourceUrl,
+  { baseUrl = config.upstreamBase, timeoutMs = config.requestTimeoutMs } = {},
+) {
+  const playerUrl = `${baseUrl}/jiexi.php?url=${encodeURIComponent(sourceUrl)}`;
   let playerHtml;
   try {
     playerHtml = await fetchText(playerUrl, {
       accept: "text/html,application/xhtml+xml",
+      timeoutMs,
     });
   } catch (err) {
     throw upstreamFailure(err);
@@ -117,11 +135,12 @@ export async function resolveStream(rawUrl) {
 
   let payload;
   try {
-    payload = await fetchJson(`${config.upstreamBase}/api.php`, {
+    payload = await fetchJson(`${baseUrl}/api.php`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ url: sourceUrl, time, key }),
       accept: "application/json",
+      timeoutMs,
     });
   } catch (err) {
     throw upstreamFailure(err);
@@ -134,18 +153,13 @@ export async function resolveStream(rawUrl) {
   ) {
     // 上游响应的 title 是广告文案，只记录状态码，绝不下传。
     log.warn("provider.parse_failed", { code: payload?.code });
-    throw new AppError("PARSE_FAILED", 502, "上游解析失败，请稍后重试");
+    throw new AppError("PARSE_FAILED", 502, "上游解析失败，请稍后重试", {
+      detail: { upstreamCode: payload?.code },
+    });
   }
 
   const playUrl = decryptPlayUrl(payload.url);
-  const expirySeconds = Number(payload.expire_time);
-  const expiresInSeconds = Number(payload.expires_in);
-  const expiresAtMs =
-    Number.isFinite(expirySeconds) && expirySeconds > 0
-      ? expirySeconds * 1000
-      : Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
-        ? Date.now() + expiresInSeconds * 1000
-        : null;
+  const expiresAtMs = upstreamExpiry(payload.expire_time, payload.expires_in);
 
   return {
     sourceUrl,

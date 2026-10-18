@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AppError } from "../src/errors.js";
+import { HTTP_CHANNELS, resolveHttpChannel } from "../src/providers/http.js";
 import { createServer } from "../src/server.js";
 
 const SAMPLE = "https://www.bilibili.com/video/BV1JP41167xK";
@@ -22,7 +23,19 @@ async function start(t, overrides = {}) {
   const server = createServer({
     resolve: async () => fakeResult(),
     resolveBrowser: null,
+    httpChannels: [],
     validate: async () => ({ playlist: "#EXTM3U" }),
+    guardMedia: async () => {},
+    race: async (candidates) => ({
+      winner: candidates[0] || null,
+      ranked: candidates.map((item, index) => ({
+        provider: item.provider,
+        playUrl: item.playUrl,
+        type: item.type,
+        available: true,
+        selected: index === 0,
+      })),
+    }),
     enrich: async () => ({ title: "测试视频", cover: null }),
     fetchDanmaku: async () => ({
       provider: "dmku",
@@ -81,6 +94,273 @@ test("GET /api/parse supports mp4 results", async (t) => {
   assert.equal(body.data.sourceUrl, SAMPLE);
 });
 
+test("qilin API success becomes a single-use fallback without server media reads", async (t) => {
+  const channel = HTTP_CHANNELS.find((item) => item.id === "qilin");
+  const media = "https://cdn.example/qilin.m3u8";
+  let requests = 0;
+  const validated = [];
+  const raced = [];
+  const { base } = await start(t, {
+    httpChannels: [channel],
+    resolveHttp: (entry, sourceUrl, options) => resolveHttpChannel(entry, sourceUrl, {
+      ...options,
+      request: async () => ({
+        text: ++requests === 1
+          ? '<script>const playerConfig = { apiToken: "synthetic-page-value" };</script>'
+          : JSON.stringify({ code: 200, url: media, type: "m3u8" }),
+      }),
+    }),
+    validate: async (url) => {
+      validated.push(url);
+      return { playlist: "#EXTM3U" };
+    },
+    race: async (candidates) => {
+      raced.push(...candidates.map((item) => item.provider));
+      const candidate = candidates[0];
+      return {
+        winner: candidate,
+        ranked: [{
+          provider: candidate.provider,
+          playUrl: candidate.playUrl,
+          type: candidate.type,
+          speedKBps: 1000,
+          ttfbMs: 100,
+          score: 10000,
+          available: true,
+          selected: true,
+        }],
+      };
+    },
+  });
+
+  const { response, body } = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(response.status, 200);
+  assert.equal(body.data.provider, "test");
+  assert.equal(requests, 2);
+  assert.equal(validated.includes(media), false);
+  assert.deepEqual(raced, ["test"]);
+  const qilin = body.data.candidates.find((item) => item.provider === "qilin");
+  assert.equal(qilin.singleUse, true);
+  assert.equal(qilin.available, true);
+  assert.equal(qilin.verified, false);
+  assert.ok(!JSON.stringify(body).includes("synthetic-page-value"));
+});
+
+test("parse diagnostics expose per-channel status and timing", async (t) => {
+  const channel = HTTP_CHANNELS.find((item) => item.id === "qilin");
+  const pageChannel = HTTP_CHANNELS.find((item) => item.id === "jiexi789-page");
+  const media = "https://cdn.example/diagnostics.m3u8";
+  let requests = 0;
+  const { base } = await start(t, {
+    httpChannels: [channel, pageChannel],
+    resolveHttp: (entry, sourceUrl, options) => {
+      if (entry.id === "jiexi789-page") {
+        throw new AppError("PARSE_FAILED", 502, "上游解析失败，请稍后重试", {
+          detail: { upstreamCode: 404 },
+        });
+      }
+      return resolveHttpChannel(entry, sourceUrl, {
+        ...options,
+        request: async () => ({
+          text: ++requests === 1
+            ? '<script>const playerConfig = { apiToken: "synthetic" };</script>'
+            : JSON.stringify({ code: 200, url: media, type: "m3u8" }),
+        }),
+      });
+    },
+  });
+  const { response, body } = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(response.status, 200);
+  assert.ok(Array.isArray(body.data.diagnostics));
+  const builtIn = body.data.diagnostics.find((item) => item.provider === "jiexi789");
+  assert.equal(builtIn.status, "benchmarked");
+  assert.ok(builtIn.ms >= 0);
+  const qilin = body.data.diagnostics.find((item) => item.provider === "qilin");
+  assert.equal(qilin.status, "single-use");
+  assert.equal(qilin.singleUse, true);
+  assert.equal(qilin.playHost, "cdn.example");
+  assert.ok(qilin.ms >= 0);
+  const failed = body.data.diagnostics.find((item) => item.provider === "jiexi789-page");
+  assert.equal(failed.status, "rejected");
+  assert.equal(failed.detail.upstreamCode, 404);
+});
+
+test("verified HTTP channel candidates still pass validation and racing", async (t) => {
+  const channel = HTTP_CHANNELS.find((item) => item.id === "jiexi789-page");
+  let validated = 0;
+  let raced = 0;
+  const { base } = await start(t, {
+    httpChannels: [channel],
+    resolveHttp: async () => fakeResult({
+      provider: "jiexi789-page",
+      playUrl: "https://media.example/jiexi789-page.mp4",
+      type: "mp4",
+    }),
+    validate: async () => {
+      validated += 1;
+      return { playlist: "#EXTM3U" };
+    },
+    race: async (candidates) => {
+      raced += 1;
+      const candidate = candidates[0];
+      return {
+        winner: candidate,
+        ranked: [{
+          provider: candidate.provider,
+          playUrl: candidate.playUrl,
+          type: candidate.type,
+          speedKBps: candidate.provider === "jiexi789-page" ? 200 : 100,
+          ttfbMs: 10,
+          score: candidate.provider === "jiexi789-page" ? 2000 : 1000,
+          available: true,
+          selected: true,
+        }],
+      };
+    },
+  });
+
+  const { response, body } = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(response.status, 200);
+  assert.equal(body.data.provider, "jiexi789-page");
+  assert.ok(validated >= 2);
+  assert.equal(raced, 2);
+});
+
+test("single-use candidates are returned by parse and /api/race without media reads", async (t) => {
+  let raced = 0;
+  const { base } = await start(t, {
+    resolve: async () => { throw new AppError("PARSE_FAILED", 502, "no upstream"); },
+    httpChannels: [HTTP_CHANNELS.find((item) => item.id === "qilin")],
+    resolveHttp: async () => ({
+      sourceUrl: SAMPLE,
+      playUrl: "https://media.example/single-use.m3u8",
+      type: "m3u8",
+      provider: "qilin",
+      singleUse: true,
+      expiresAtMs: Date.now() + 60_000,
+    }),
+    race: async () => {
+      raced += 1;
+      return { winner: null, ranked: [] };
+    },
+  });
+
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(parse.response.status, 200);
+  assert.equal(parse.body.data.provider, "qilin");
+  assert.equal(parse.body.data.singleUse, true);
+
+  const race = await getJson(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sourceUrl: SAMPLE }),
+  });
+  assert.equal(race.response.status, 200);
+  assert.equal(race.body.data.selected.provider, "qilin");
+  assert.equal(race.body.data.selected.singleUse, true);
+  assert.deepEqual(race.body.data.filtered, {
+    total: 1,
+    excluded: 0,
+    expired: 0,
+    remaining: 1,
+  });
+  assert.equal(raced, 0);
+
+  const exhausted = await getJson(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sourceUrl: SAMPLE,
+      failedPlayUrls: ["https://media.example/single-use.m3u8"],
+    }),
+  });
+  assert.equal(exhausted.response.status, 200);
+  assert.equal(exhausted.body.data.selected, null);
+  assert.deepEqual(exhausted.body.data.filtered, {
+    total: 1,
+    excluded: 1,
+    expired: 0,
+    remaining: 0,
+  });
+});
+
+test("bingdou runs only when primary channels have no available candidate", async (t) => {
+  const bingdou = HTTP_CHANNELS.find((item) => item.id === "bingdou");
+  const run = async (primaryResolve) => {
+    let browserCalls = 0;
+    const { base } = await start(t, {
+      resolve: primaryResolve,
+      httpChannels: [bingdou],
+      resolveBingdou: async () => {
+        browserCalls += 1;
+        return { playUrl: "https://media.example/bingdou.mp4", type: "mp4" };
+      },
+      resolveHttp: (channel, sourceUrl, options) => resolveHttpChannel(channel, sourceUrl, {
+        ...options,
+        request: async () => ({ text: '<iframe src="https://jiexi.bot.cd/?url=demo"></iframe>' }),
+      }),
+    });
+    const { response, body } = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+    return { response, body, browserCalls };
+  };
+
+  const primaryOk = await run(async () => fakeResult());
+  assert.equal(primaryOk.response.status, 200);
+  assert.equal(primaryOk.body.data.provider, "test");
+  assert.equal(primaryOk.browserCalls, 0);
+
+  const primaryFailed = await run(async () => {
+    throw new AppError("PARSE_FAILED", 502, "no upstream");
+  });
+  assert.equal(primaryFailed.response.status, 200);
+  assert.equal(primaryFailed.body.data.provider, "bingdou");
+  assert.equal(primaryFailed.body.data.singleUse, true);
+  assert.equal(primaryFailed.browserCalls, 1);
+});
+
+test("bingdou still runs when only single-use primaries are available", async (t) => {
+  const qilin = HTTP_CHANNELS.find((item) => item.id === "qilin");
+  const bingdou = HTTP_CHANNELS.find((item) => item.id === "bingdou");
+  let browserCalls = 0;
+  let qilinRequests = 0;
+  const { base } = await start(t, {
+    resolve: async () => { throw new AppError("PARSE_FAILED", 502, "no upstream"); },
+    httpChannels: [qilin, bingdou],
+    resolveBingdou: async () => {
+      browserCalls += 1;
+      return { playUrl: "https://media.example/bingdou.mp4", type: "mp4" };
+    },
+    resolveHttp: (channel, sourceUrl, options) => {
+      if (channel.id === "bingdou") {
+        return resolveHttpChannel(channel, sourceUrl, {
+          ...options,
+          request: async () => ({
+            text: '<iframe src="https://jiexi.bot.cd/?url=demo"></iframe>',
+          }),
+        });
+      }
+      return resolveHttpChannel(channel, sourceUrl, {
+        ...options,
+        request: async () => ({
+          text: ++qilinRequests === 1
+            ? '<script>const playerConfig = { apiToken: "synthetic" };</script>'
+            : JSON.stringify({ code: 200, url: "https://media.example/qilin.m3u8", type: "m3u8" }),
+        }),
+      });
+    },
+  });
+  const { response, body } = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(response.status, 200);
+  assert.equal(browserCalls, 1);
+  const providers = body.data.candidates.map((item) => item.provider);
+  assert.ok(providers.includes("qilin"));
+  assert.ok(providers.includes("bingdou"));
+  assert.equal(
+    body.data.diagnostics.some((item) => item.provider === "bingdou" && item.status === "single-use"),
+    true,
+  );
+});
+
 test("GET /api/parse races multiple providers and selects the faster stream", async (t) => {
   const { base } = await start(t, {
     resolve: async () => ({
@@ -95,14 +375,23 @@ test("GET /api/parse races multiple providers and selects the faster stream", as
       type: "m3u8",
       provider: "jx-browser",
     }),
-    race: async (candidates) => ({
-      winner:
-        candidates.find((c) => c.provider === "jx-browser") || candidates[0],
-      ranked: [
-        { provider: "jx-browser", speedKBps: 3500, ttfbMs: 80, selected: true },
-        { provider: "789jiexi", speedKBps: 110, ttfbMs: 2500, selected: false },
-      ],
-    }),
+    race: async (candidates) => {
+      const candidate = candidates[0];
+      const fast = candidate.provider === "jx-browser";
+      return {
+        winner: candidate,
+        ranked: [{
+          provider: candidate.provider,
+          playUrl: candidate.playUrl,
+          type: candidate.type,
+          speedKBps: fast ? 3500 : 110,
+          ttfbMs: fast ? 80 : 2500,
+          score: fast ? 43750 : 44,
+          available: true,
+          selected: true,
+        }],
+      };
+    },
   });
 
   const { response, body } = await getJson(
@@ -382,71 +671,131 @@ test("GET /api/title returns platform episode pages", async (t) => {
   assert.equal(body.data.platforms[0].episodes[0].pageUrl, "https://www.iqiyi.com/v_1.html");
 });
 
-test("/api/race benchmarks multiple candidate streams and returns ranked results", async (t) => {
+test("/api/race only benchmarks verified candidates from a prior parse", async (t) => {
   const { base } = await start(t, {
+    resolveBrowser: async () => fakeResult({
+      provider: "backup",
+      playUrl: "https://media.example/backup.mp4",
+      type: "mp4",
+    }),
+    resolve: async () => fakeResult({ provider: "primary" }),
     race: async (candidates) => {
       const ranked = candidates.map((c, idx) => {
-        const available = c.provider !== "失效源";
         return {
           ...c,
           speedKBps: idx === 0 ? 3000 : 1500,
           ttfbMs: idx === 0 ? 100 : 200,
-          available,
-          selected: available && idx === 0,
+          available: true,
+          selected: idx === 0,
         };
       });
-      return { winner: ranked.find((item) => item.selected) || null, ranked };
+      return { winner: ranked[0] || null, ranked };
     },
   });
 
-  const emptyResponse = await fetch(`${base}/api/race`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ candidates: [] }),
-    signal: AbortSignal.timeout(5000),
-  });
-  assert.equal(emptyResponse.status, 400);
-
-  const raceResponse = await fetch(`${base}/api/race`, {
+  const untrustedResponse = await fetch(`${base}/api/race`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      candidates: [
-        { provider: "源1", playUrl: "https://media1.example/1.m3u8", type: "m3u8" },
-        { provider: "源2", playUrl: "https://media2.example/2.m3u8", type: "m3u8" },
-      ],
+      candidates: [{ provider: "arbitrary", playUrl: "http://127.0.0.1/private" }],
     }),
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(untrustedResponse.status, 400);
+
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(parse.response.status, 200);
+  const raceResponse = await fetch(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sourceUrl: SAMPLE, failedPlayUrls: ["https://media.example/video.m3u8"] }),
     signal: AbortSignal.timeout(5000),
   });
   const raceBody = await raceResponse.json();
   assert.equal(raceResponse.status, 200);
   assert.equal(raceBody.ok, true);
-  assert.equal(raceBody.data.selected.provider, "源1");
-  assert.equal(raceBody.data.candidates.length, 2);
+  assert.equal(raceBody.data.selected.provider, "backup");
+  assert.equal(raceBody.data.candidates.length, 1);
 
-  const deadResponse = await fetch(`${base}/api/race`, {
+  const exhaustedResponse = await fetch(`${base}/api/race`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      candidates: [
-        { provider: "失效源", playUrl: "https://dead.example/1.m3u8", type: "m3u8" },
-      ],
+      sourceUrl: SAMPLE,
+      failedPlayUrls: ["https://media.example/video.m3u8", "https://media.example/backup.mp4"],
     }),
     signal: AbortSignal.timeout(5000),
   });
-  const deadBody = await deadResponse.json();
-  assert.equal(deadResponse.status, 200);
-  assert.equal(deadBody.data.selected, null);
+  assert.equal(exhaustedResponse.status, 200);
+  assert.equal((await exhaustedResponse.json()).data.selected, null);
 
-  const getRaceResponse = await fetch(
-    `${base}/api/race?sources=${encodeURIComponent(
-      JSON.stringify([
-        { provider: "源1", playUrl: "https://media1.example/1.m3u8", type: "m3u8" },
-      ]),
-    )}`,
-    { signal: AbortSignal.timeout(5000) },
-  );
-  assert.equal(getRaceResponse.status, 200);
+  const getRaceResponse = await fetch(`${base}/api/race?sources=%5B%5D`);
+  assert.equal(getRaceResponse.status, 405);
+});
+
+test("parse rejects candidates when validation or benchmarking fails", async (t) => {
+  const invalid = await start(t, {
+    validate: async () => { throw new AppError("STREAM_INVALID", 502, "invalid"); },
+  });
+  const first = await getJson(`${invalid.base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(first.response.status, 502);
+  assert.equal(first.body.error.code, "STREAM_INVALID");
+
+  const stalled = await start(t, {
+    race: async () => ({ winner: null, ranked: [] }),
+  });
+  const second = await getJson(`${stalled.base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(second.response.status, 502);
+  assert.equal(second.body.error.code, "STREAM_INVALID");
+});
+
+test("HTTP channel failures are isolated and resolution stays bounded", async (t) => {
+  let active = 0;
+  let peak = 0;
+  const channels = HTTP_CHANNELS.filter((item) => !item.fallback);
+  const { base } = await start(t, {
+    httpChannels: channels,
+    resolve: async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+      return fakeResult();
+    },
+    resolveHttp: async (channel) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+      if (channel.id === "jiexi789-page") throw new AppError("PARSE_FAILED", 502, "not supported");
+      return fakeResult({
+        provider: channel.id,
+        playUrl: `https://media.example/${channel.id}.mp4`,
+        type: "mp4",
+      });
+    },
+  });
+  const { response, body } = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(response.status, 200);
+  assert.ok(peak <= channels.length + 1);
+  assert.equal(body.data.candidates.length, 3);
+  assert.equal(body.data.candidates.some((item) => item.provider === "jiexi789-page"), false);
+});
+
+test("an upstream failure briefly cools down only that channel", async (t) => {
+  let calls = 0;
+  const { base } = await start(t, {
+    httpChannels: [HTTP_CHANNELS[0]],
+    resolveHttp: async () => {
+      calls += 1;
+      throw new AppError("UPSTREAM_ERROR", 502, "offline");
+    },
+  });
+  for (const source of [SAMPLE, IQIYI]) {
+    const { response } = await getJson(`${base}/api/parse?url=${encodeURIComponent(source)}`);
+    assert.equal(response.status, 200);
+  }
+  assert.equal(calls, 1);
 });
 
 

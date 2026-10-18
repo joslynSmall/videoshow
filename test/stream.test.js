@@ -42,6 +42,16 @@ test("validateStream rejects an invalid m3u8 playlist", async () => {
   );
 });
 
+test("validateStream cancels an inaccessible playlist response", async (t) => {
+  let canceled = false;
+  t.mock.method(globalThis, "fetch", async () => new Response(new ReadableStream({
+    cancel() { canceled = true; },
+  }), { status: 404 }));
+  await assert.rejects(validateStream("https://8.8.8.8/a.m3u8", "m3u8"),
+    { code: "STREAM_INVALID" });
+  assert.equal(canceled, true);
+});
+
 test("validateStream accepts mp4 via HEAD", async () => {
   const result = await validateStream("https://example.com/a.mp4", "mp4", {
     prober: async () => ({ status: 200, contentType: "video/mp4" }),
@@ -54,7 +64,9 @@ test("validateStream falls back to a range GET", async () => {
   const result = await validateStream("https://example.com/a.mp4", "mp4", {
     prober: async (_url, options) => {
       methods.push(options.method);
-      return methods.length === 1 ? { status: 405 } : { status: 206 };
+      return methods.length === 1
+        ? { status: 405 }
+        : { status: 206, contentRange: "bytes 0-0/1024" };
     },
   });
   assert.deepEqual(methods, ["HEAD", "GET"]);
@@ -67,6 +79,15 @@ test("validateStream rejects an unavailable mp4", async () => {
       validateStream("https://example.com/a.mp4", "mp4", {
         prober: async () => ({ status: 404 }),
       }),
+    (err) => err.code === "STREAM_INVALID",
+  );
+});
+
+test("validateStream rejects an HTML response that reports success", async () => {
+  await assert.rejects(
+    validateStream("https://example.com/a.mp4", "mp4", {
+      prober: async () => ({ status: 200, contentType: "text/html" }),
+    }),
     (err) => err.code === "STREAM_INVALID",
   );
 });

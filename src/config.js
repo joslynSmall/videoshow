@@ -27,12 +27,20 @@ export const config = {
   enableBrowserProvider: process.env.VERCEL
     ? process.env.ENABLE_BROWSER_PROVIDER === "true"
     : process.env.ENABLE_BROWSER_PROVIDER !== "false",
+  httpProviderIds: process.env.HTTP_PROVIDER_IDS === undefined
+    ? null
+    : process.env.HTTP_PROVIDER_IDS
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean),
+  httpProviderTimeoutMs: intEnv("HTTP_PROVIDER_TIMEOUT_MS", 12000),
   chromeBin: process.env.CHROME_BIN || "/usr/bin/google-chrome",
   benchmarkTimeoutMs: intEnv("BENCHMARK_TIMEOUT_MS", 3000),
   requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15000),
   metadataTimeoutMs: intEnv("METADATA_TIMEOUT_MS", 5000),
   danmakuTimeoutMs: intEnv("DANMAKU_TIMEOUT_MS", 10000),
   streamTimeoutMs: intEnv("STREAM_TIMEOUT_MS", 10000),
+  mediaDnsMode: process.env.MEDIA_DNS_MODE || "auto",
   searchTimeoutMs: intEnv("SEARCH_TIMEOUT_MS", 8000),
   catalogSearchUrl:
     process.env.CATALOG_SEARCH_URL || "https://api.so.360kan.com/index",
@@ -42,6 +50,10 @@ export const config = {
   cacheMaxEntries: intEnv("CACHE_MAX_ENTRIES", 200),
   publicDir: path.join(projectRoot, "public"),
 };
+
+if (!["system", "public", "auto"].includes(config.mediaDnsMode)) {
+  throw new Error("MEDIA_DNS_MODE must be system, public, or auto");
+}
 
 for (const [name, value] of [
   ["UPSTREAM_BASE", config.upstreamBase],

@@ -1,7 +1,12 @@
 function write(stream, level, message, meta) {
-  const line = `${new Date().toISOString()} ${level} ${message}`;
-  if (meta === undefined) stream(line);
-  else stream(line, meta);
+  const entry = {
+    time: new Date().toISOString(),
+    level,
+    event: message,
+  };
+  if (meta && typeof meta === "object") Object.assign(entry, meta);
+  else if (meta !== undefined) entry.detail = meta;
+  stream(JSON.stringify(entry));
 }
 
 export const log = {

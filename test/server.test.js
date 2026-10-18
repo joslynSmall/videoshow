@@ -213,6 +213,26 @@ test("POST /api/parse returns method not allowed", async (t) => {
   assert.equal(body.error.code, "METHOD_NOT_ALLOWED");
 });
 
+test("GET /api/media relays a parsed stream and rejects a missing url", async (t) => {
+  const missingServer = await start(t);
+  const missing = await fetch(`${missingServer.base}/api/media`);
+  const missingBody = await missing.json();
+  assert.equal(missing.status, 400);
+  assert.equal(missingBody.error.code, "BAD_REQUEST");
+
+  const { base } = await start(t, {
+    openMediaFn: async () =>
+      new Response("#EXTM3U\n", {
+        status: 200,
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      }),
+  });
+  const response = await fetch(`${base}/api/media?url=${encodeURIComponent("https://cdn.example/a.m3u8")}`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /mpegurl/);
+  assert.equal(await response.text(), "#EXTM3U\n");
+});
+
 test("GET /api/health reports service status", async (t) => {
   const { base } = await start(t);
   const { response, body } = await getJson(`${base}/api/health`);

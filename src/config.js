@@ -24,7 +24,9 @@ export const config = {
     "https://pcw-api.iqiyi.com/video/video/playervideoinfo",
   danmakuBaseUrl:
     process.env.DANMAKU_BASE_URL || "https://jx.1ljx.com/dan/@lirose_tv/",
-  enableBrowserProvider: process.env.ENABLE_BROWSER_PROVIDER !== "false",
+  enableBrowserProvider: process.env.VERCEL
+    ? process.env.ENABLE_BROWSER_PROVIDER === "true"
+    : process.env.ENABLE_BROWSER_PROVIDER !== "false",
   chromeBin: process.env.CHROME_BIN || "/usr/bin/google-chrome",
   benchmarkTimeoutMs: intEnv("BENCHMARK_TIMEOUT_MS", 3000),
   requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15000),

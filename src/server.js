@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import http from "node:http";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { raceAndSelect } from "./benchmark.js";
@@ -11,6 +13,7 @@ import { enrichMetadata } from "./metadata.js";
 import { normalizeVideoUrl, resolveStream } from "./provider.js";
 import { resolveWithBrowser } from "./providers/jx-browser.js";
 import { loadCatalogTitle, searchCatalog } from "./catalog.js";
+import { openMedia } from "./media.js";
 import { extractExpiry, normalizeType, validateStream } from "./stream.js";
 
 const STATIC_FILES = new Map([
@@ -83,6 +86,15 @@ const HTML_CSP = [
   "form-action 'self'",
   "frame-ancestors 'none'",
 ].join("; ");
+
+function hostOf(value) {
+  if (typeof value !== "string" || !value) return "";
+  try {
+    return new URL(value).host;
+  } catch {
+    return "";
+  }
+}
 
 function sendJson(res, status, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
@@ -174,6 +186,7 @@ export function createServer({
   fetchDanmaku = fetchDmkuDanmaku,
   search = searchCatalog,
   loadTitle = loadCatalogTitle,
+  openMediaFn = openMedia,
   race = raceAndSelect,
   logger = log,
   now = Date.now,
@@ -280,6 +293,20 @@ export function createServer({
     };
 
     storeCached(parseCache, sourceUrl, data, expiresAtMs);
+    logger.info("parse.selected", {
+      pageHost: hostOf(sourceUrl),
+      provider: data.provider,
+      type: data.type,
+      playHost: hostOf(data.playUrl),
+      candidates: (ranked || []).map((item) => ({
+        provider: item.provider,
+        playHost: hostOf(item.playUrl),
+        speedKBps: item.speedKBps,
+        ttfbMs: item.ttfbMs,
+        available: item.available,
+        selected: item.selected,
+      })),
+    });
     sendJson(res, 200, { ok: true, data });
   }
 
@@ -311,13 +338,90 @@ export function createServer({
       throw new AppError("INVALID_KEYWORD", 400, "缺少搜索关键词");
     }
     const items = await search(kw.trim());
+    logger.info("search.completed", {
+      keyword: kw.trim().slice(0, 80),
+      count: items.length,
+    });
     sendJson(res, 200, { ok: true, data: { items } });
+  }
+
+  async function handleMedia(req, res, requestUrl) {
+    const target = requestUrl.searchParams.get("url") || "";
+    const startedAt = Date.now();
+    const response = await openMediaFn(target, req.headers);
+    const headers = {
+      "content-type": response.headers.get("content-type") || "application/octet-stream",
+      "cache-control": "no-store",
+    };
+    for (const name of ["content-length", "content-range", "accept-ranges"]) {
+      const value = response.headers.get(name);
+      if (value) headers[name] = value;
+    }
+    res.writeHead(response.status, headers);
+    logger.info("media.fetch", {
+      host: hostOf(target),
+      status: response.status,
+      type: response.headers.get("content-type") || "",
+      ms: Date.now() - startedAt,
+    });
+    if (!response.body || req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    try {
+      await pipeline(Readable.fromWeb(response.body), res);
+    } catch (err) {
+      logger.warn("media.aborted", {
+        host: hostOf(target),
+        message: err?.message,
+      });
+      res.destroy();
+    }
+  }
+
+  async function handleClientLog(req, res) {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const raw = Buffer.concat(chunks).toString("utf8");
+    let body;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      throw new AppError("BAD_REQUEST", 400, "无效的 JSON 请求体");
+    }
+    const event = typeof body?.event === "string" ? body.event : "";
+    const allowed = new Set([
+      "playback.start",
+      "playback.switch",
+      "playback.failed",
+      "playback.recover",
+    ]);
+    if (!allowed.has(event)) {
+      throw new AppError("BAD_REQUEST", 400, "未知的日志事件");
+    }
+    const fields = {};
+    for (const key of ["pageHost", "playHost", "fromHost", "toHost", "episode", "provider", "reason"]) {
+      const value = body[key];
+      if (typeof value === "string" && value) fields[key] = value.slice(0, 160);
+    }
+    if (Number.isFinite(body?.continueAt)) fields.continueAt = Math.round(body.continueAt);
+    logger.info(event, fields);
+    sendJson(res, 200, { ok: true });
   }
 
   async function handleTitle(res, requestUrl) {
     const cat = requestUrl.searchParams.get("cat") || "";
     const id = requestUrl.searchParams.get("id") || "";
     const data = await loadTitle(cat, id);
+    logger.info("title.loaded", {
+      cat,
+      id,
+      title: data?.title || "",
+      platforms: (data?.platforms || []).map((item) => ({
+        id: item.id,
+        episodes: Array.isArray(item.episodes) ? item.episodes.length : 0,
+      })),
+    });
     sendJson(res, 200, { ok: true, data });
   }
 
@@ -421,6 +525,24 @@ export function createServer({
           return;
         }
         await handleTitle(res, requestUrl);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/client-log") {
+        if (req.method !== "POST") {
+          sendMethodNotAllowed(res, "POST");
+          return;
+        }
+        await handleClientLog(req, res);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/media") {
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          sendMethodNotAllowed(res, "GET, HEAD");
+          return;
+        }
+        await handleMedia(req, res, requestUrl);
         return;
       }
 

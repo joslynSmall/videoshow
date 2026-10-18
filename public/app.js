@@ -7,9 +7,7 @@
   const result = document.querySelector("#result");
   const player = document.querySelector("#player");
   const videoTitle = document.querySelector("#video-title");
-  const sourceUrl = document.querySelector("#source-url");
   const expiry = document.querySelector("#expiry");
-  const copyButton = document.querySelector("#copy-button");
 
   // 新增界面元素
   const historyToggleBtn = document.querySelector("#history-toggle-button");
@@ -37,9 +35,16 @@
   const episodesModalTitle = document.querySelector("#episodes-modal-title");
 
   let art = null;
-  let lastPlayUrl = "";
   let currentMedia = null; // 当前播放的完整上下文信息
   let progressSaveTimer = 0;
+  let stallTimer = 0;
+  let switchingLine = false;
+
+  function clearStallTimer() {
+    if (!stallTimer) return;
+    window.clearTimeout(stallTimer);
+    stallTimer = 0;
+  }
 
   /* =========================================================================
      1. 播放历史与断点持久化 Store
@@ -70,6 +75,17 @@
         let list = this.getAll();
         const now = Date.now();
         const existingIndex = list.findIndex((x) => x.id === item.id);
+        const previous = existingIndex >= 0 ? list[existingIndex] : null;
+        const progress = { ...(previous?.progress || {}) };
+        if (previous && !previous.progress && Number.isFinite(previous.currentTime)) {
+          progress[progressKey(previous)] = {
+            currentTime: previous.currentTime || 0,
+            duration: previous.duration || 0,
+          };
+        }
+        const currentTime = Math.floor(item.currentTime || 0);
+        const duration = Math.floor(item.duration || 0);
+        progress[progressKey(item)] = { currentTime, duration };
         const record = {
           id: item.id,
           title: item.title || "未知视频",
@@ -79,9 +95,10 @@
           type: item.type || "m3u8",
           episodeName: item.episodeName || "",
           episodeIndex: typeof item.episodeIndex === "number" ? item.episodeIndex : 0,
-          currentTime: Math.floor(item.currentTime || 0),
-          duration: Math.floor(item.duration || 0),
+          currentTime,
+          duration,
           episodes: Array.isArray(item.episodes) ? item.episodes : [],
+          progress,
           updatedAt: now,
         };
 
@@ -144,6 +161,23 @@
       } catch {}
     },
   };
+
+  function progressKey(item) {
+    const index = typeof item?.episodeIndex === "number" ? item.episodeIndex : 0;
+    const episode = Array.isArray(item?.episodes) ? item.episodes[index] : null;
+    return episode?.pageUrl || `index:${index}`;
+  }
+
+  function resumeTimeFor(record, item) {
+    if (!record) return 0;
+    const slot = record.progress?.[progressKey(item)]
+      || (!record.progress && record.episodeIndex === (item.episodeIndex ?? 0)
+        ? { currentTime: record.currentTime || 0, duration: record.duration || 0 }
+        : null);
+    if (!slot) return 0;
+    if (slot.currentTime > 5 && slot.duration - slot.currentTime > 10) return slot.currentTime;
+    return 0;
+  }
 
   function renderSearchHistory() {
     if (!searchHistory || !searchHistoryList) return;
@@ -233,25 +267,114 @@
     }
   }
 
-  function playM3u8(video, url, artInstance) {
-    if (!window.Hls?.isSupported()) {
-      if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = url;
+  async function recoverDirectUrl(url) {
+    const response = await fetch(url, { cache: "no-store" });
+    const text = (await response.text()).replace(/^\uFEFF/, "").trim();
+    if (!text || text.startsWith("#EXTM3U")) return null;
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    const next = payload?.url;
+    if (typeof next !== "string" || !/^https?:\/\//i.test(next)) return null;
+    return {
+      playUrl: next,
+      type: /\.m3u8(\?|$)/i.test(next) ? "m3u8" : "mp4",
+    };
+  }
+
+  function playM3u8(video, url, artInstance, onFatal, onAttached) {
+    const tried = new Set();
+    const retry = { maxNumRetry: 2, retryDelayMs: 300, maxRetryDelayMs: 1000 };
+    const startHls = (source) => {
+      onAttached?.();
+      if (!window.Hls?.isSupported()) {
+        if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          video.src = source;
+          return;
+        }
+        onFatal?.();
         return;
       }
-      throw new Error("当前浏览器不支持 HLS 播放");
-    }
 
-    const hls = new window.Hls({ enableWorker: true });
-    hls.loadSource(url);
-    hls.attachMedia(video);
-    hls.on(window.Hls.Events.ERROR, (_event, detail) => {
-      if (detail?.fatal) {
-        setStatus("视频流加载失败，可能已过期，请重新解析。", "error");
+      const BaseLoader = window.Hls.DefaultConfig?.loader;
+      const loader = BaseLoader
+        ? class ProxyMediaLoader extends BaseLoader {
+            load(context, config, callbacks) {
+              const original = context?.url;
+              if (typeof original === "string" && /^https?:\/\//i.test(original)) {
+                try {
+                  if (new URL(original).origin !== location.origin) {
+                    context.url = `${location.origin}/api/media?url=${encodeURIComponent(original)}`;
+                  }
+                } catch {
+                  // 地址无法解析时保持原请求，让播放器按失败处理。
+                }
+              }
+              super.load(context, config, callbacks);
+            }
+          }
+        : undefined;
+      const hls = new window.Hls({
+        enableWorker: false,
+        ...(loader ? { loader } : {}),
+        fragLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 8000,
+            maxLoadTimeMs: 20000,
+            timeoutRetry: retry,
+            errorRetry: retry,
+          },
+        },
+      });
+      hls.loadSource(source);
+      hls.attachMedia(video);
+      hls.on(window.Hls.Events.ERROR, (_event, detail) => {
+        if (!detail?.fatal) return;
         hls.destroy();
+        if (tried.has(source)) {
+          onFatal?.();
+          return;
+        }
+        tried.add(source);
+        recoverDirectUrl(source)
+          .then((recovered) => {
+            if (recovered && recovered.playUrl !== source) {
+              useRecovered(recovered);
+              return;
+            }
+            onFatal?.();
+          })
+          .catch(() => onFatal?.());
+      });
+      artInstance.once("destroy", () => hls.destroy());
+    };
+
+    const useRecovered = (recovered) => {
+      reportPlayback("playback.recover", {
+        fromHost: hostOf(url),
+        toHost: hostOf(recovered.playUrl),
+      });
+      setStatus("正在重新连接，请稍候…", "loading");
+      if (recovered.type === "mp4") {
+        onAttached?.();
+        video.src = recovered.playUrl;
+        return;
       }
-    });
-    artInstance.once("destroy", () => hls.destroy());
+      startHls(recovered.playUrl);
+    };
+
+    recoverDirectUrl(url)
+      .then((recovered) => {
+        if (recovered && recovered.playUrl !== url) {
+          useRecovered(recovered);
+          return;
+        }
+        startHls(url);
+      })
+      .catch(() => startHls(url));
   }
 
   async function loadDanmaku(endpoint) {
@@ -276,16 +399,107 @@
     return title.replace(/(\s+第\d+集|\s+全集|\s+正片)+/gi, "").trim() || title;
   }
 
+  async function pickFasterSource(candidates) {
+    try {
+      const response = await fetch("/api/race", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({ candidates }),
+      });
+      const payload = await response.json();
+      const selected = payload?.data?.selected;
+      if (response.ok && selected?.playUrl && selected.available !== false) return selected;
+    } catch (err) {
+      console.warn("重新测速失败", err);
+    }
+    return candidates.find((item) => item.playUrl && item.available !== false) || null;
+  }
+
+  async function switchToSmootherSource(data) {
+    if (switchingLine) return;
+    const video = player.querySelector("video");
+    const continueAt = video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const failed = new Set(Array.isArray(data.failedPlayUrls) ? data.failedPlayUrls : []);
+    if (data.playUrl) failed.add(data.playUrl);
+    const pool = (data.candidates || []).filter((item) => item.playUrl && !failed.has(item.playUrl));
+    if (!pool.length) {
+      reportPlayback("playback.failed", {
+        playHost: hostOf(data.playUrl),
+        episode: data.episodeName || "",
+        reason: "no-alternative",
+      });
+      setStatus("暂时播不了，请稍后再试。", "error");
+      return;
+    }
+    switchingLine = true;
+    clearStallTimer();
+    setStatus("播放不够流畅，正在更换线路…", "loading");
+    try {
+      const chosen = await pickFasterSource(pool);
+      if (!chosen?.playUrl) {
+        reportPlayback("playback.failed", {
+          playHost: hostOf(data.playUrl),
+          episode: data.episodeName || "",
+          reason: "race-empty",
+        });
+        setStatus("暂时播不了，请稍后再试。", "error");
+        return;
+      }
+      reportPlayback("playback.switch", {
+        fromHost: hostOf(data.playUrl),
+        toHost: hostOf(chosen.playUrl),
+        episode: data.episodeName || "",
+        continueAt,
+      });
+      showResult({
+        ...data,
+        playUrl: chosen.playUrl,
+        type: chosen.type || (/\.mp4(\?|$)/i.test(chosen.playUrl) ? "mp4" : "m3u8"),
+        continueAt,
+        failedPlayUrls: [...failed],
+        candidates: (data.candidates || []).map((item) => ({
+          ...item,
+          selected: item.playUrl === chosen.playUrl,
+        })),
+      });
+    } finally {
+      switchingLine = false;
+    }
+  }
+
+  function hostOf(value) {
+    try {
+      return new URL(value).host;
+    } catch {
+      return "";
+    }
+  }
+
+  function reportPlayback(event, fields) {
+    fetch("/api/client-log", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ event, ...fields }),
+    }).catch(() => {});
+  }
+
   function showResult(data) {
-    lastPlayUrl = data.playUrl;
+    clearStallTimer();
     const baseTitle = data.baseTitle || currentMedia?.baseTitle || cleanBaseTitle(data.title);
     const displayTitle = data.episodeName ? `${baseTitle} ${data.episodeName}` : (data.title || baseTitle);
 
     videoTitle.textContent = displayTitle;
-    sourceUrl.textContent = data.sourceUrl || input.value.trim();
     expiry.textContent = formatExpiry(data.expiresAt);
-    copyButton.disabled = false;
     document.title = `${displayTitle} · videoshow`;
+    reportPlayback("playback.start", {
+      pageHost: hostOf(data.sourceUrl),
+      playHost: hostOf(data.playUrl),
+      provider: data.provider || "",
+      episode: data.episodeName || "",
+    });
 
     result.hidden = false;
     destroyPlayer();
@@ -314,13 +528,21 @@
       episodes: Array.isArray(data.episodes) ? data.episodes : (catalogPlayback ? (currentMedia?.episodes || []) : []),
     };
 
-    // 检查历史断点
+    // 手动换线时沿用当前进度；否则只恢复这一集自己的进度。
     const savedRecord = HistoryStore.get(currentMedia.id);
-    const resumeTime = (savedRecord && savedRecord.currentTime > 5 && (savedRecord.duration - savedRecord.currentTime > 10))
-      ? savedRecord.currentTime
-      : 0;
+    const resumeTime = Number.isFinite(data.continueAt)
+      ? data.continueAt
+      : resumeTimeFor(savedRecord, currentMedia);
 
     const danmakuEndpoint = data.danmaku?.endpoint || "";
+    let playbackFailed = false;
+    let sourceAttached = false;
+    const failPlayback = () => {
+      if (!sourceAttached || playbackFailed) return;
+      playbackFailed = true;
+      clearStallTimer();
+      switchToSmootherSource(data);
+    };
 
     art = new window.Artplayer({
       container: player,
@@ -337,7 +559,12 @@
       hotkey: true,
       autoSize: false,
       theme: "#c6f36b",
-      customType: { m3u8: playM3u8 },
+      customType: {
+        m3u8: (video, url, artInstance) =>
+          playM3u8(video, url, artInstance, failPlayback, () => {
+            sourceAttached = true;
+          }),
+      },
       plugins: [
         window.artplayerPluginDanmuku({
           danmuku: () => loadDanmaku(danmakuEndpoint),
@@ -350,6 +577,20 @@
         }),
       ],
     });
+
+    art.on("video:playing", () => {
+      clearStallTimer();
+      if (status.classList.contains("loading")) setStatus("", "");
+    });
+    art.on("video:waiting", () => {
+      clearStallTimer();
+      stallTimer = window.setTimeout(() => {
+        const current = player.querySelector("video");
+        if (!current || current.paused || current.readyState >= 3) return;
+        failPlayback();
+      }, 8000);
+    });
+    art.on("destroy", clearStallTimer);
 
     art.on("ready", () => {
       if (resumeTime > 0) {
@@ -389,56 +630,11 @@
       setStatus("弹幕加载失败，播放不受影响。", "error");
     });
     art.on("video:error", () => {
-      setStatus("视频加载失败，可能已过期，请重新解析。", "error");
+      failPlayback();
     });
 
     // 渲染选集栏
     renderEpisodes(currentMedia.episodes, currentMedia.episodeIndex);
-
-    const sourcesBar = document.querySelector("#sources-bar");
-    if (sourcesBar) {
-      sourcesBar.innerHTML = "";
-      if (Array.isArray(data.candidates) && data.candidates.length > 1) {
-        for (const c of data.candidates) {
-          const btn = document.createElement("button");
-          btn.type = "button";
-          btn.className = "source-tag" + (c.selected ? " active" : "");
-          let speedStr = "测速超时";
-          if (c.speedKBps > 0) {
-            speedStr =
-              c.speedKBps >= 1024
-                ? (c.speedKBps / 1024).toFixed(1) + " MB/s"
-                : c.speedKBps + " KB/s";
-          }
-          const ttfbStr =
-            c.ttfbMs && Number.isFinite(c.ttfbMs) ? c.ttfbMs + "ms" : "";
-          btn.textContent =
-            (c.selected ? "★ 最快源: " : "") +
-            c.provider +
-            " (" +
-            speedStr +
-            (ttfbStr ? ", " + ttfbStr : "") +
-            ")";
-          if (c.available === false) {
-            btn.disabled = true;
-          } else if (!c.selected && c.playUrl) {
-            btn.addEventListener("click", () => {
-              showResult({
-                ...data,
-                playUrl: c.playUrl,
-                type: c.type,
-                provider: c.provider,
-                candidates: data.candidates.map((x) => ({
-                  ...x,
-                  selected: x.provider === c.provider,
-                })),
-              });
-            });
-          }
-          sourcesBar.appendChild(btn);
-        }
-      }
-    }
 
     centerPlayer();
   }
@@ -901,16 +1097,6 @@
   window.addEventListener("click", (e) => {
     if (e.target === historyModal) historyModal.hidden = true;
     if (e.target === episodesModal) episodesModal.hidden = true;
-  });
-
-  copyButton.addEventListener("click", async () => {
-    if (!lastPlayUrl) return;
-    try {
-      await navigator.clipboard.writeText(lastPlayUrl);
-      setStatus("播放地址已复制。", "");
-    } catch {
-      setStatus("复制失败，请检查浏览器权限。", "error");
-    }
   });
 
   const initialUrl = new URLSearchParams(window.location.search).get("url");

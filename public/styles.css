@@ -360,13 +360,6 @@ input {
   overflow-wrap: anywhere;
 }
 
-.source-url {
-  margin: 5px 0 0;
-  font: 10.5px/1.6 var(--mono);
-  color: var(--muted);
-  overflow-wrap: anywhere;
-}
-
 .sources-bar {
   display: flex;
   flex-wrap: wrap;

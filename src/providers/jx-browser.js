@@ -10,11 +10,42 @@ export function inferPlaybackType(playUrl) {
   return /\.mp4(\?|$)/i.test(playUrl) ? "mp4" : "m3u8";
 }
 
+// 重试窗口：jx-browser 依赖上游解析站 jx.1ljx.com 的边缘节点，
+// 偶发 ECONNRESET（TLS 握手前连接被重置）。这类瞬时抖动重试一次成功率很高。
+// 只重试“页面加载/提取失败”（PARSE_FAILED）；
+// BROWSER_UNAVAILABLE（Chrome 未安装）与 BROWSER_ERROR（DevTools 端口起不来）是本地环境问题，重试无意义。
+const BROWSER_RETRY_ATTEMPTS = 2;
+const BROWSER_RETRY_DELAY_MS = 800;
+
+// 导出以便测试：哪些错误值得重试。
+export function isRetryableBrowserError(err) {
+  return err?.code === "PARSE_FAILED";
+}
+
 export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
   if (!fs.existsSync(CHROME_PATH)) {
     throw new AppError("BROWSER_UNAVAILABLE", 503, "无头 Chrome 未安装");
   }
+  let lastError = null;
+  for (let attempt = 1; attempt <= BROWSER_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await resolveOnce(sourceUrl, timeoutMs);
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableBrowserError(err) || attempt === BROWSER_RETRY_ATTEMPTS) throw err;
+      log.warn("browser.resolve.retry", {
+        provider: "jx-browser",
+        attempt,
+        code: err?.code,
+        message: err?.message,
+      });
+      await new Promise((r) => setTimeout(r, BROWSER_RETRY_DELAY_MS));
+    }
+  }
+  throw lastError;
+}
 
+async function resolveOnce(sourceUrl, timeoutMs) {
   const dataDir = path.join("/tmp", "vs-chrome-" + Date.now() + "-" + Math.random().toString(36).slice(2));
   fs.mkdirSync(dataDir, { recursive: true });
 
@@ -31,11 +62,29 @@ export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
   ], { stdio: "ignore" });
 
   let cleaned = false;
+  // Chrome 收到 SIGTERM 后需要一点时间关闭 profile，目录删太快会因 SingletonLock
+  // 等文件仍被占用而失败，残留 /tmp/vs-chrome-* 目录。
+  // 用异步退避重试，避免 Atomics.wait 阻塞事件循环影响其它并发请求。
+  const removeDirSoon = async () => {
+    for (let i = 0; i < 15; i += 1) {
+      try {
+        fs.rmSync(dataDir, { recursive: true, force: true });
+        return true;
+      } catch {
+        if (i === 4) { try { chrome.kill("SIGKILL"); } catch {} }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+    try { chrome.kill("SIGKILL"); } catch {}
+    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch {}
+    return false;
+  };
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
-    try { chrome.kill("SIGKILL"); } catch {}
-    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch {}
+    try { chrome.kill("SIGTERM"); } catch {}
+    // 不等待目录删除：解析结果已经拿到，残留目录由 removeDirSoon 异步清理。
+    void removeDirSoon();
   };
 
   const activePortFile = path.join(dataDir, "DevToolsActivePort");

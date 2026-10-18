@@ -284,6 +284,67 @@ test("single-use candidates are returned by parse and /api/race without media re
   });
 });
 
+// 回归：单次签名候选的过期时间必须随候选进入缓存。
+// 之前 expiresAtMs 只挂在 candidate 上，缓存里的 ranked 全是 undefined，
+// /api/race 的过期过滤因此失效，表现为“刚解析完就全部过期”。
+test("single-use candidates carry expiresAtMs into parse and race", async (t) => {
+  const expiresAtMs = Date.now() + 240_000;
+  const { base } = await start(t, {
+    resolve: async () => { throw new AppError("PARSE_FAILED", 502, "no upstream"); },
+    httpChannels: [HTTP_CHANNELS.find((item) => item.id === "qilin")],
+    resolveHttp: async () => ({
+      sourceUrl: SAMPLE,
+      playUrl: "https://media.example/single-use.m3u8",
+      type: "m3u8",
+      provider: "qilin",
+      singleUse: true,
+      expiresAtMs,
+    }),
+    race: async () => ({ winner: null, ranked: [] }),
+  });
+
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(parse.response.status, 200);
+  const candidate = parse.body.data.candidates.find((item) => item.singleUse);
+  assert.ok(candidate, "single-use candidate should be present");
+  assert.equal(candidate.expiresAtMs, expiresAtMs, "parse response must expose expiresAtMs");
+
+  const race = await getJson(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sourceUrl: SAMPLE }),
+  });
+  assert.equal(race.body.data.selected.provider, "qilin");
+  assert.equal(race.body.data.filtered.expired, 0, "a fresh link must not be counted as expired");
+  assert.equal(race.body.data.filtered.remaining, 1);
+});
+
+// 回归：换线后“重新解析以刷新单次签名地址”必须真的重新解析。
+// 之前 parse() 命中缓存直接返回旧数据，过期候选永远刷不新。
+test("/api/parse?force=1 bypasses the cache to refresh expiring links", async (t) => {
+  let calls = 0;
+  const { base } = await start(t, {
+    resolve: async () => {
+      calls += 1;
+      return fakeResult({ playUrl: `https://media.example/video-${calls}.m3u8` });
+    },
+  });
+
+  const first = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(first.response.status, 200);
+  assert.equal(first.body.data.cached, false);
+  assert.equal(calls, 1);
+
+  const cached = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(cached.body.data.cached, true, "second call should hit the cache");
+  assert.equal(calls, 1, "cached parse must not call the resolver again");
+
+  const forced = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}&force=1`);
+  assert.equal(forced.response.status, 200);
+  assert.equal(forced.body.data.cached, false, "force=1 must bypass the cache");
+  assert.equal(calls, 2, "force=1 must re-run the resolver");
+});
+
 test("bingdou runs only when primary channels have no available candidate", async (t) => {
   const bingdou = HTTP_CHANNELS.find((item) => item.id === "bingdou");
   const run = async (primaryResolve) => {

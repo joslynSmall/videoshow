@@ -183,17 +183,26 @@ export async function resolveHttpChannel(channel, sourceUrl, options = {}) {
     : { playUrl: mediaUrl(response?.redirectUrl) || extractHttpPlayUrl(response?.text), type: "" };
   const playUrl = mediaUrl(result.playUrl);
   if (!playUrl) throw new AppError("PARSE_FAILED", 502, "解析渠道未返回媒体地址");
+  // 单次签名链接的本地有效期估计。
+// 实测：主线路 fragLoadTimeOut 可能要 40-50 秒才触发，而原来的 45 秒兼口刚卡在
+// 主线路死亡之前，导致备用线路在换线时已全部过期（expired=N，remaining=0）。
+// 这里把兼口拉到与解析缓存同量级，并保留“上游声明的 x-expires”优先。
+const SINGLE_USE_MIN_TTL_MS = 240_000;
+const SINGLE_USE_FALLBACK_TTL_MS = 300_000;
+
+function singleUseExpiry(playUrl) {
+  const expires = Number(new URL(playUrl).searchParams.get("x-expires"));
+  if (Number.isFinite(expires) && expires > 0) {
+    const expiresMs = expires > 1e12 ? expires : expires * 1000;
+    // 上游给出的期限优先，但至少保留 SINGLE_USE_MIN_TTL_MS，避免刚解析就过期。
+    return Math.max(Date.now() + SINGLE_USE_MIN_TTL_MS, expiresMs - 30_000);
+  }
+  // 没有 x-expires 时无法得知上游真实寿命，用一个足够覆盖“主线路崩溃+换线”的兼口。
+  return Date.now() + SINGLE_USE_FALLBACK_TTL_MS;
+}
   const singleUse = channel.singleUse === true;
   let expiresAtMs;
-  if (singleUse) {
-    const expires = Number(new URL(playUrl).searchParams.get("x-expires"));
-    const expiresMs = Number.isFinite(expires) && expires > 0
-      ? (expires > 1e12 ? expires : expires * 1000)
-      : 0;
-    expiresAtMs = expiresMs > 0
-      ? Math.max(Date.now() + 10_000, expiresMs - 30_000)
-      : Date.now() + 45_000;
-  }
+  if (singleUse) expiresAtMs = singleUseExpiry(playUrl);
   return {
     sourceUrl,
     playUrl,

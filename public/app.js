@@ -66,6 +66,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   const episodesGrid = document.querySelector("#episodes-grid");
   const episodesModalTitle = document.querySelector("#episodes-modal-title");
   const PLAYBACK_RATES = [0.5, 0.8, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2, 2.5, 3];
+  // 播放器上的快进/快退按钮步长，与 Artplayer 默认键盘 SEEK_STEP(5s) 区分开。
+  const SEEK_BUTTON_STEP = 10;
   const autoplayNextInput = document.querySelector("#autoplay-next");
   const autoplayToggle = autoplayNextInput?.closest(".autoplay-toggle");
   const AUTOPLAY_NEXT_KEY = "videoshow_autoplay_next_v1";
@@ -141,6 +143,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     for (const item of candidates || []) {
       devlog(label, {
         provider: item.provider,
+        kind: item.kind || "-",
         available: item.available,
         verified: item.verified,
         singleUse: item.singleUse,
@@ -153,12 +156,13 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     }
   }
 
-  function devlogLatencyRanking(data) {
+  function devlogLatencyRanking(data, nowMs = Date.now()) {
     const candidates = new Map((data.candidates || []).map((item) => [item.provider, item]));
     const rows = (data.diagnostics || []).map((item) => {
       const candidate = candidates.get(item.provider);
       return {
         provider: item.provider,
+        kind: item.kind || candidate?.kind || "-",
         status: item.status,
         resolveMs: item.ms,
         ttfbMs: item.ttfbMs ?? candidate?.ttfbMs ?? null,
@@ -168,6 +172,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         code: item.code,
         message: item.message,
         detail: item.detail,
+        // 剩余寿命：单次签名链接会在几十秒后过期，不打印的话
+        // 排行看起来“还有几条可用”，实际换线时可能已全部失效。
+        expiresInSec: Number.isFinite(candidate?.expiresAtMs)
+          ? Math.round((candidate.expiresAtMs - nowMs) / 1000)
+          : null,
       };
     });
     if (!rows.length) return;
@@ -186,6 +195,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     const lines = rows.map((item, index) => {
       const parts = [
         `${index + 1}. ${item.provider}`,
+        `类型=${item.kind}`,
         `status=${item.status}`,
         `解析耗时=${item.resolveMs ?? "-"}ms`,
       ];
@@ -202,6 +212,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         if (item.detail) parts.push(`detail=${devlogValue(item.detail)}`);
       }
       if (item.selected) parts.push("selected");
+      if (Number.isFinite(item.expiresInSec)) {
+        parts.push(item.expiresInSec > 0 ? `剩余=${item.expiresInSec}s` : "已过期");
+      }
       return parts.join(" ");
     });
     devlog(
@@ -251,8 +264,67 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   function clearStallTimer() {
     if (!stallTimer) return;
+    // 同一个句柄既可能是 timeout（换线前的守卫）也可能是 interval（播放看门狗），两种都要清。
     window.clearTimeout(stallTimer);
+    window.clearInterval(stallTimer);
     stallTimer = 0;
+  }
+
+  // 播放器上的快进/快退按钮。手机上没有物理键盘，默认的方向键快进不可用，
+  // 所以在控制区追加两个可点按钮，每次跳转 SEEK_BUTTON_STEP 秒。
+  function seekButton(name, step, label, glyph) {
+    return {
+      name,
+      position: "right",
+      index: 11,
+      // Artplayer 会把 html 包进自己的 .art-control 容器，所以内层不能再用 art-control 类名，
+      // 否则选择器会命中两层、尺寸被覆盖两次。
+      html: `<div class="seek-btn-inner" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;cursor:pointer"><span style="font-size:16px;line-height:1">${glyph}</span></div>`,
+      click: () => {
+        if (!art || switchingLine) return;
+        const duration = Number(art.duration);
+        const current = Number(art.currentTime) || 0;
+        // 跳转目标夹在 [0, duration]，避免快退到负值或快进越过片尾。
+        const target = Math.min(
+          Number.isFinite(duration) && duration > 0 ? duration : Infinity,
+          Math.max(0, current + step),
+        );
+        art.currentTime = target;
+        art.notice.show = `${label} ${formatTime(Math.abs(target - current))}`;
+        devlog("快进快退", { action: label, from: Math.round(current), to: Math.round(target) }, "info");
+      },
+    };
+  }
+
+  // 弹幕插件的渲染循环门控在 art.playing 上，而 Artplayer 的 playing 定义要求
+  // readyState > 2（HAVE_FUTURE_DATA）。缓冲一耗尽，art.playing 变为 false，
+  // 插件立即停止推进与渲染，屏幕上最后一条弹幕也会一起消失。
+  // 这里接管 art.playing：只要用户确实想看（已播放过且未暂停未结束）就视为正在播放，
+  // 让画面卡顿时弹幕保持静止显示，而不是整层不见。
+  function keepDanmakuVisibleDuringStall(instance) {
+    if (!instance) return;
+    let startedPlaying = false;
+    instance.on("video:playing", () => {
+      startedPlaying = true;
+    });
+    // Artplayer 把 playing 定义为不可配置的 getter（defineProperty 会抛
+    // "Cannot redefine property"），所以不能直接覆盖；改为拦截原型链上的读取。
+    const proto = Object.getPrototypeOf(instance);
+    const descriptor = proto && Object.getOwnPropertyDescriptor(proto, "playing");
+    if (!descriptor || typeof descriptor.get !== "function") return;
+    Object.defineProperty(proto, "playing", {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get() {
+        const value = descriptor.get.call(this);
+        if (value) return true;
+        // 原判定为 false 时再判断是否只是卡顿：用户确实想看且没暂停，就仍然算正在播放。
+        const video = this.template?.$video;
+        if (!video) return false;
+        if (video.paused || video.ended) return false;
+        return startedPlaying || video.currentTime > 0;
+      },
+    });
   }
 
   /* =========================================================================
@@ -726,23 +798,27 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         Number(b.available !== false) - Number(a.available !== false) ||
         (b.score ?? 0) - (a.score ?? 0) ||
         (a.ttfbMs ?? Infinity) - (b.ttfbMs ?? Infinity));
+      const raceNow = Date.now();
       if (raceRanked.length) {
         devlog("race 排行", "\n" + raceRanked.map((item, index) => {
           const flags = [item.selected ? "selected" : "", item.singleUse ? "singleUse" : ""]
             .filter(Boolean).join(" ");
-          return `${index + 1}. ${item.provider} TTFB=${item.ttfbMs ?? "-"}ms 速度=${item.speedKBps ?? "-"}KB/s score=${item.score ?? "-"}${flags ? ` ${flags}` : ""}`;
+          const life = Number.isFinite(item.expiresAtMs)
+            ? (item.expiresAtMs > raceNow ? ` 剩余=${Math.round((item.expiresAtMs - raceNow) / 1000)}s` : " 已过期")
+            : "";
+          return `${index + 1}. ${item.provider} 类型=${item.kind || "-"} TTFB=${item.ttfbMs ?? "-"}ms 速度=${item.speedKBps ?? "-"}KB/s score=${item.score ?? "-"}${life}${flags ? ` ${flags}` : ""}`;
         }).join("\n"), "info");
       }
       if (response.status === 409 && !refreshed) {
-        devlog("race 缓存过期", "重新解析后重试", "warn");
-        await parse(sourceUrl);
+        devlog("race 缓存过期", "强制重新解析后重试", "warn");
+        await parse(sourceUrl, { force: true });
         return pickFasterSource(sourceUrl, failedPlayUrls, true);
       }
       if (response.ok && selected?.playUrl && selected.available !== false) return selected;
       if (response.ok && !selected && !refreshed) {
-        devlog("race 无候选", "重新解析以刷新单次签名地址", "warn");
+        devlog("race 无候选", "强制重新解析以刷新单次签名地址", "warn");
         try {
-          await parse(sourceUrl);
+          await parse(sourceUrl, { force: true });
         } catch (err) {
           devlog("重新解析失败", err instanceof Error ? err.message : String(err), "error");
           return null;
@@ -876,6 +952,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     for (const item of data.diagnostics || []) {
       devlog("渠道诊断", {
         provider: item.provider,
+        kind: item.kind || "-",
         status: item.status,
         ms: item.ms,
         code: item.code,
@@ -949,6 +1026,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     const danmakuEndpoint = data.danmaku?.endpoint || "";
     let playbackFailed = false;
     let hasPlayed = false;
+    let playRequested = false;
     let sourceAttached = data.type !== "m3u8";
     const failPlayback = (force = false) => {
       if (playbackFailed) return;
@@ -972,6 +1050,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       fullscreen: true,
       pip: true,
       hotkey: true,
+      controls: [
+        seekButton("seek-back", -SEEK_BUTTON_STEP, "快退", "⏪"),
+        seekButton("seek-forward", SEEK_BUTTON_STEP, "快进", "⏩"),
+      ],
       autoSize: false,
       theme: "#c6f36b",
       customType: {
@@ -993,51 +1075,104 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       ],
     });
 
-    art.on("video:playing", () => {
-      playbackFailed = false;
-      hasPlayed = true;
-      clearStallTimer();
-      if (status.classList.contains("loading")) setStatus("", "");
-    });
-    // 卡顿判定：必须已经播放过、未暂停/未 seek，8 秒内前进不足 1 秒且缓冲仍不足时才换线。
-    // 选集后尚未点播放、暂停、拖动进度条或已经恢复缓冲，都不触发换线。
-    art.on("video:waiting", () => {
-      clearStallTimer();
-      const waitingAt = player.querySelector("video")?.currentTime ?? 0;
-      stallTimer = window.setTimeout(() => {
+    // 播放进度看门狗：每 1 秒轮询一次，判断"播放是否真的在推进"。
+    //
+    // 为什么用轮询而不用 waiting 事件：
+    //   1. HLS.js 卡在首帧时可能既不派发 playing 也不派发 waiting，事件驱动会完全漏判；
+    //   2. 真实卡顿时 waiting 会高频重复派发，任何"收到事件就重置计时/停表"的写法都会让阈值永远计不满；
+    //   3. 所以看门狗完全独立运行，不注册任何 waiting 监听，事件一律不干预它。
+    //
+    // 换线门槛（全部满足才换）：
+    //   1. hasPlayed（video:playing 已触发，真的开始出画面了）或
+    //      playRequested（video:play 已触发，用户确实要求播放但源不给首帧）；
+    //      两者都不成立时说明用户尚未介入（未点播放且未自动播放），不当作卡顿；
+    //   2. !paused && !seeking && !ended；
+    //   3. readyState < HAVE_FUTURE_DATA(3)：缓冲确实不足；
+    //   4. 连续 STALL_SECONDS 秒 currentTime 前进不足 STALL_PROGRESS 秒。
+    const STALL_SECONDS = 8;
+    const STALL_PROGRESS = 1;
+    let stallAnchorTime = player.querySelector("video")?.currentTime ?? 0;
+    let stallAnchorAt = Date.now();
+    const markStallAnchor = () => {
+      const current = player.querySelector("video");
+      if (!current) return;
+      stallAnchorTime = current.currentTime;
+      stallAnchorAt = Date.now();
+    };
+    const stopWatchdog = () => {
+      if (stallTimer) {
+        window.clearInterval(stallTimer);
+        stallTimer = 0;
+      }
+    };
+    const armWatchdog = () => {
+      if (stallTimer || playbackFailed) return;
+      markStallAnchor();
+      stallTimer = window.setInterval(() => {
+        if (playbackFailed || art !== activeArt) return;
         const current = player.querySelector("video");
-        if (!current || !hasPlayed || current.paused || current.seeking || current.readyState >= 3) {
-          devlog("卡顿恢复", {
-            currentTime: Math.round(current?.currentTime || 0),
-            readyState: current?.readyState ?? "-",
-            played: hasPlayed,
-            paused: current?.paused ?? "-",
-            seeking: current?.seeking ?? "-",
-          }, "info");
+        if (!current) return;
+        if (!hasPlayed && !playRequested) {
+          // 用户尚未要求播放（未点播放且未自动播放成功）：不是卡顿。
+          markStallAnchor();
           return;
         }
-        const progressed = Math.abs(current.currentTime - waitingAt);
-        if (progressed >= 1) {
-          devlog("卡顿恢复", {
-            currentTime: Math.round(current.currentTime * 10) / 10,
-            progressed: Math.round(progressed * 10) / 10,
-            readyState: current.readyState,
-          }, "info");
+        if (current.paused || current.seeking || current.ended) {
+          // 用户暂停或主动拖动进度条：不是卡顿，重置基准。
+          markStallAnchor();
           return;
         }
+        if (current.readyState >= 3) {
+          // 缓冲充足：正常状态或已恢复，重置基准。
+          markStallAnchor();
+          return;
+        }
+        const stalledFor = (Date.now() - stallAnchorAt) / 1000;
+        const progressed = Math.abs(current.currentTime - stallAnchorTime);
+        if (progressed >= STALL_PROGRESS) {
+          // 仍在缓慢推进，暂不换线。
+          markStallAnchor();
+          return;
+        }
+        if (stalledFor < STALL_SECONDS) return;
         devlog("卡顿超时", {
           currentTime: Math.round(current.currentTime * 10) / 10,
-          progressed: Math.round(progressed * 10) / 10,
+          progressed: Math.round(progressed * 100) / 100,
+          stalledSeconds: Math.round(stalledFor),
           readyState: current.readyState,
           paused: current.paused,
           seeking: current.seeking,
+          hasPlayed,
         }, "warn");
+        stopWatchdog();
         failPlayback(true);
-      }, 8000);
-    });
-    art.on("destroy", clearStallTimer);
+      }, 1000);
+    };
     const activeArt = art;
-    art.on("destroy", () => activeArt.hls?.destroy());
+    // 看门狗完全独立运行，不监听 waiting：真实卡顿时 waiting 会高频重复派发，
+    // 任何"收到事件就重置计时或停表"的写法都会让阈值永远计不满。
+    armWatchdog();
+    // 弹幕在卡顿时消失的修复：
+    // 弹幕插件的渲染循环门控在 art.playing 上，而 Artplayer 的 playing 定义要求
+    // readyState > 2（HAVE_FUTURE_DATA）。缓冲一耗尽，art.playing 立刻变 false，
+    // 插件就停止推进和渲染，画面上最后一条弹幕也会消失。
+    // 这里的判定改成"用户是否想看"：只要没暂停、没结束、确实播放过，就继续渲染，
+    // 画面停在某一帧时弹幕保持静止，而不是整层消失。
+    keepDanmakuVisibleDuringStall(activeArt);
+    art.on("video:play", () => {
+      // 自动播放被浏览器拦截时不会派发 playing，但用户确实要求过播放。
+      playRequested = true;
+    });
+    art.on("video:playing", () => {
+      hasPlayed = true;
+      playbackFailed = false;
+      armWatchdog();
+      if (status.classList.contains("loading")) setStatus("", "");
+    });
+    art.on("destroy", () => {
+      stopWatchdog();
+      activeArt.hls?.destroy();
+    });
 
     art.on("ready", () => {
       if (resumeTime > 0) {
@@ -1576,9 +1711,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     searchSection.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  async function parse(url) {
-    devlog("解析请求", { host: hostOf(url) }, "info");
-    const response = await fetch(`/api/parse?url=${encodeURIComponent(url)}`, {
+  async function parse(url, options = {}) {
+    devlog("解析请求", { host: hostOf(url), force: options.force === true }, "info");
+    // force=1 绕过服务端缓存重新解析：换线后用于刷新已过期的单次签名地址。
+    const forceParam = options.force ? "&force=1" : "";
+    const response = await fetch(`/api/parse?url=${encodeURIComponent(url)}${forceParam}`, {
       headers: { accept: "application/json" },
     });
 

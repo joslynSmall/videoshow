@@ -265,22 +265,30 @@ export function createServer({
 
   async function handleParse(res, requestUrl) {
     const sourceUrl = normalizeVideoUrl(requestUrl.searchParams.get("url"));
-    const cached = getCached(parseCache, sourceUrl);
+    // force=1 用于换线后的重新解析：必须绕过缓存重新走解析，
+    // 否则拿回同一批已过期的单次链接，刷新签名地址的兜底逻辑会完全失效。
+    const force = requestUrl.searchParams.get("force") === "1";
+    const cached = force ? null : getCached(parseCache, sourceUrl);
     if (cached) {
       sendJson(res, 200, { ok: true, data: { ...cached.data, cached: true } });
       return;
     }
 
-    const resolvers = [{ id: "jiexi789", run: () => resolve(sourceUrl) }];
+    const resolvers = [
+      // kind 用于日志区分渠道实现方式，由服务端定义，前端不做硬编码推断。
+      { id: "jiexi789", kind: "api", run: () => resolve(sourceUrl) },
+    ];
     if (config.enableBrowserProvider && resolveBrowser) {
       resolvers.push({
         id: "jx-browser",
+        kind: "browser",
         run: () => resolveBrowser(sourceUrl, config.requestTimeoutMs),
       });
     }
     for (const channel of httpChannels) {
       resolvers.push({
         id: channel.id,
+        kind: "http-api",
         fallback: channel.fallback === true,
         run: () => resolveHttp(channel, sourceUrl, {
           timeoutMs: config.httpProviderTimeoutMs,
@@ -294,7 +302,7 @@ export function createServer({
     let resolvedCount = 0;
     const runResolvers = (list) => mapLimited(list, list.length, async (item) => {
       const startedAt = performance.now();
-      const diagnostic = { provider: item.id };
+      const diagnostic = { provider: item.id, kind: item.kind };
       const finish = (status, extra = {}) => {
         diagnostics.push({
           ...diagnostic,
@@ -338,8 +346,13 @@ export function createServer({
             candidate,
             ranked: {
               provider: candidate.provider,
+              kind: item.kind,
               playUrl: candidate.playUrl,
               type: candidate.type,
+              // 单次签名链接必须带上过期时间，前端日志和 /api/race 都依赖它。
+              ...(Number.isFinite(candidate.expiresAtMs)
+                ? { expiresAtMs: candidate.expiresAtMs }
+                : {}),
               speedKBps: 0,
               ttfbMs: null,
               score: 0,
@@ -389,6 +402,7 @@ export function createServer({
           candidate,
           ranked: {
             provider: candidate.provider,
+            kind: item.kind,
             playUrl: candidate.playUrl,
             type: candidate.type,
             speedKBps: 0,
@@ -412,7 +426,7 @@ export function createServer({
       });
       return {
         candidate: raceResult.winner,
-        ranked: { ...single, verified: true, singleUse: false },
+        ranked: { ...single, provider: candidate.provider, kind: item.kind, verified: true, singleUse: false },
       };
     }).then((items) => items.filter(Boolean));
 
@@ -426,6 +440,7 @@ export function createServer({
         for (const item of fallback) {
           diagnostics.push({
             provider: item.id,
+            kind: item.kind,
             status: "fallback-skipped",
             ms: 0,
             message: "已有可用已验证线路",
@@ -454,6 +469,12 @@ export function createServer({
     const winner = measured.find((item) => item.ranked.available);
     const ranked = measured.map((item) => ({
       ...item.ranked,
+      // expiresAtMs 必须随候选一起缓存：/api/race 的过期过滤读的就是这个字段，
+      // 之前只存在于 candidate 上，缓存里的 ranked 全部为 undefined，
+      // 导致 singleUse 候选要么被永久保留，要么被错误排除。
+      ...(Number.isFinite(item.candidate?.expiresAtMs)
+        ? { expiresAtMs: item.candidate.expiresAtMs }
+        : {}),
       selected: item === winner && item.ranked.available,
     }));
     const selectedResult = winner.candidate;
@@ -707,6 +728,11 @@ export function createServer({
           timeoutMs: config.benchmarkTimeoutMs,
         });
         ranked = raceResult?.ranked ?? [];
+        // race 的 ranked 由 benchmark 生成，不含 kind；回填缓存候选上的渠道类型。
+        ranked = ranked.map((item) => {
+          const source = verifiedCandidates.find((c) => c.provider === item.provider);
+          return { ...item, kind: source?.kind };
+        });
       } catch (err) {
         logger.warn("race.failed", { message: err?.message });
       }
@@ -715,8 +741,10 @@ export function createServer({
       ranked.find((c) => c.selected && c.available !== false) ?? null;
     const singleUseRanked = singleUseCandidates.map((item, index) => ({
       provider: item.provider,
+      kind: item.kind,
       playUrl: item.playUrl,
       type: item.type,
+      ...(Number.isFinite(item.expiresAtMs) ? { expiresAtMs: item.expiresAtMs } : {}),
       speedKBps: 0,
       ttfbMs: null,
       score: 0,

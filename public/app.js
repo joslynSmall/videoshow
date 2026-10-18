@@ -74,7 +74,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   let currentMedia = null; // 当前播放的完整上下文信息
   let progressSaveTimer = 0;
   let stallTimer = 0;
-  let startupTimer = 0;
   let switchingLine = false;
 
   const devlogEl = document.querySelector("#devlog");
@@ -254,12 +253,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (!stallTimer) return;
     window.clearTimeout(stallTimer);
     stallTimer = 0;
-  }
-
-  function clearStartupTimer() {
-    if (!startupTimer) return;
-    window.clearTimeout(startupTimer);
-    startupTimer = 0;
   }
 
   /* =========================================================================
@@ -477,7 +470,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   function destroyPlayer() {
-    clearStartupTimer();
     if (art) {
       art.destroy();
       art = null;
@@ -779,7 +771,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (data.playUrl) failed.add(data.playUrl);
     switchingLine = true;
     clearStallTimer();
-    clearStartupTimer();
     setStatus("播放不够流畅，正在更换线路…", "loading");
     devlog("触发换线", {
       from: data.provider || "-",
@@ -958,14 +949,12 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     const danmakuEndpoint = data.danmaku?.endpoint || "";
     let playbackFailed = false;
     let hasPlayed = false;
-    let startupFallbackUsed = false;
     let sourceAttached = data.type !== "m3u8";
     const failPlayback = (force = false) => {
       if (playbackFailed) return;
       if (!sourceAttached && !force) return;
       playbackFailed = true;
       clearStallTimer();
-      clearStartupTimer();
       switchToSmootherSource(data);
     };
 
@@ -1008,30 +997,45 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       playbackFailed = false;
       hasPlayed = true;
       clearStallTimer();
-      clearStartupTimer();
       if (status.classList.contains("loading")) setStatus("", "");
     });
+    // 卡顿判定：必须已经播放过、未暂停/未 seek，8 秒内前进不足 1 秒且缓冲仍不足时才换线。
+    // 选集后尚未点播放、暂停、拖动进度条或已经恢复缓冲，都不触发换线。
     art.on("video:waiting", () => {
       clearStallTimer();
+      const waitingAt = player.querySelector("video")?.currentTime ?? 0;
       stallTimer = window.setTimeout(() => {
         const current = player.querySelector("video");
-        if (!current || current.paused || current.readyState >= 3) {
+        if (!current || !hasPlayed || current.paused || current.seeking || current.readyState >= 3) {
           devlog("卡顿恢复", {
             currentTime: Math.round(current?.currentTime || 0),
             readyState: current?.readyState ?? "-",
+            played: hasPlayed,
+            paused: current?.paused ?? "-",
+            seeking: current?.seeking ?? "-",
+          }, "info");
+          return;
+        }
+        const progressed = Math.abs(current.currentTime - waitingAt);
+        if (progressed >= 1) {
+          devlog("卡顿恢复", {
+            currentTime: Math.round(current.currentTime * 10) / 10,
+            progressed: Math.round(progressed * 10) / 10,
+            readyState: current.readyState,
           }, "info");
           return;
         }
         devlog("卡顿超时", {
-          currentTime: Math.round(current.currentTime),
+          currentTime: Math.round(current.currentTime * 10) / 10,
+          progressed: Math.round(progressed * 10) / 10,
           readyState: current.readyState,
           paused: current.paused,
+          seeking: current.seeking,
         }, "warn");
         failPlayback(true);
       }, 8000);
     });
     art.on("destroy", clearStallTimer);
-    art.on("destroy", clearStartupTimer);
     const activeArt = art;
     art.on("destroy", () => activeArt.hls?.destroy());
 
@@ -1087,28 +1091,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       }
       playNextEpisode();
     });
-
-    // 启动阶段兜底：自动播放被拦截、前置地址请求卡住或 HLS 未附着时，
-    // 允许主动尝试一次下一候选线路，避免一直停在 0 秒/加载中。
-    clearStartupTimer();
-    startupTimer = window.setTimeout(() => {
-      if (art !== activeArt || playbackFailed || hasPlayed) return;
-      const video = player.querySelector("video");
-      if (!video || video.currentTime <= 0.1) {
-        if (startupFallbackUsed) {
-          if (video?.paused) setStatus("请点击播放继续。", "");
-          return;
-        }
-        startupFallbackUsed = true;
-        devlog("启动超时", {
-          currentTime: Math.round((video?.currentTime || 0) * 10) / 10,
-          readyState: video?.readyState ?? "-",
-          paused: video?.paused ?? "-",
-          sourceAttached,
-        }, "warn");
-        failPlayback(true);
-      }
-    }, 10000);
 
     // 渲染选集栏
     renderEpisodes(currentMedia.episodes, currentMedia.episodeIndex);

@@ -55,6 +55,66 @@ test("raceAndSelect handles empty or single candidate", async () => {
   assert.equal(single.ranked[0].selected, true);
 });
 
+test("raceAndSelect leaves every candidate unselected when none are playable", async () => {
+  const result = await raceAndSelect(
+    [
+      { provider: "dead-a", playUrl: "https://a.example/a.m3u8", type: "m3u8" },
+      { provider: "dead-b", playUrl: "https://b.example/b.m3u8", type: "m3u8" },
+    ],
+    {
+      benchmark: async () => ({
+        available: false,
+        speedKBps: 0,
+        ttfbMs: 100,
+        score: 0,
+      }),
+    },
+  );
+
+  assert.equal(result.winner, null);
+  assert.equal(result.ranked.every((item) => item.selected === false), true);
+  assert.equal(result.ranked.every((item) => item.available === false), true);
+});
+
+test("raceAndSelect probes one candidate when probeSingle is set", async () => {
+  let calls = 0;
+  const result = await raceAndSelect(
+    [{ provider: "only", playUrl: "https://a.example/a.m3u8", type: "m3u8" }],
+    {
+      probeSingle: true,
+      benchmark: async () => {
+        calls += 1;
+        return { available: false, speedKBps: 0, ttfbMs: 40, score: 0 };
+      },
+    },
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(result.winner, null);
+  assert.equal(result.ranked[0].selected, false);
+  assert.equal(result.ranked[0].available, false);
+});
+
+test("raceAndSelect selects the playable candidate ahead of a dead one", async () => {
+  const result = await raceAndSelect(
+    [
+      { provider: "dead", playUrl: "https://dead.example/a.m3u8", type: "m3u8" },
+      { provider: "live", playUrl: "https://live.example/b.m3u8", type: "m3u8" },
+    ],
+    {
+      benchmark: async (candidate) =>
+        candidate.provider === "live"
+          ? { available: true, speedKBps: 800, ttfbMs: 90, score: 8000 }
+          : { available: false, speedKBps: 0, ttfbMs: 120, score: 0 },
+    },
+  );
+
+  assert.equal(result.winner.provider, "live");
+  assert.equal(result.ranked[0].provider, "live");
+  assert.equal(result.ranked[0].selected, true);
+  assert.equal(result.ranked[1].selected, false);
+});
+
 test("raceAndSelect ranks candidates by speed and score", async () => {
   const slow = {
     provider: "slow-line",

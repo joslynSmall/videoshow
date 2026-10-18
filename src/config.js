@@ -31,6 +31,11 @@ export const config = {
   metadataTimeoutMs: intEnv("METADATA_TIMEOUT_MS", 5000),
   danmakuTimeoutMs: intEnv("DANMAKU_TIMEOUT_MS", 10000),
   streamTimeoutMs: intEnv("STREAM_TIMEOUT_MS", 10000),
+  searchTimeoutMs: intEnv("SEARCH_TIMEOUT_MS", 8000),
+  catalogSearchUrl:
+    process.env.CATALOG_SEARCH_URL || "https://api.so.360kan.com/index",
+  catalogDetailUrl:
+    process.env.CATALOG_DETAIL_URL || "https://api.web.360kan.com/v1/detail",
   cacheTtlMs: intEnv("CACHE_TTL_MS", 300000),
   cacheMaxEntries: intEnv("CACHE_MAX_ENTRIES", 200),
   publicDir: path.join(projectRoot, "public"),
@@ -40,6 +45,8 @@ for (const [name, value] of [
   ["UPSTREAM_BASE", config.upstreamBase],
   ["METADATA_IQIYI_URL", config.metadataIqiyiUrl],
   ["DANMAKU_BASE_URL", config.danmakuBaseUrl],
+  ["CATALOG_SEARCH_URL", config.catalogSearchUrl],
+  ["CATALOG_DETAIL_URL", config.catalogDetailUrl],
 ]) {
   try {
     new URL(value);

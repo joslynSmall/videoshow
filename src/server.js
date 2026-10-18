@@ -10,6 +10,7 @@ import { log } from "./log.js";
 import { enrichMetadata } from "./metadata.js";
 import { normalizeVideoUrl, resolveStream } from "./provider.js";
 import { resolveWithBrowser } from "./providers/jx-browser.js";
+import { loadCatalogTitle, searchCatalog } from "./catalog.js";
 import { extractExpiry, normalizeType, validateStream } from "./stream.js";
 
 const STATIC_FILES = new Map([
@@ -171,6 +172,8 @@ export function createServer({
   validate = validateStream,
   enrich = enrichMetadata,
   fetchDanmaku = fetchDmkuDanmaku,
+  search = searchCatalog,
+  loadTitle = loadCatalogTitle,
   race = raceAndSelect,
   logger = log,
   now = Date.now,
@@ -299,6 +302,65 @@ export function createServer({
     sendJson(res, 200, { ok: true, data });
   }
 
+  async function handleSearch(res, requestUrl) {
+    const kw =
+      requestUrl.searchParams.get("kw") ||
+      requestUrl.searchParams.get("q") ||
+      "";
+    if (!kw.trim()) {
+      throw new AppError("INVALID_KEYWORD", 400, "缺少搜索关键词");
+    }
+    const items = await search(kw.trim());
+    sendJson(res, 200, { ok: true, data: { items } });
+  }
+
+  async function handleTitle(res, requestUrl) {
+    const cat = requestUrl.searchParams.get("cat") || "";
+    const id = requestUrl.searchParams.get("id") || "";
+    const data = await loadTitle(cat, id);
+    sendJson(res, 200, { ok: true, data });
+  }
+
+  async function handleRace(req, res, requestUrl) {
+    let candidates = [];
+    if (req.method === "POST") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const raw = Buffer.concat(chunks).toString("utf8");
+      try {
+        const parsed = JSON.parse(raw);
+        candidates = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+      } catch {
+        throw new AppError("BAD_REQUEST", 400, "无效的 JSON 请求体");
+      }
+    } else if (req.method === "GET") {
+      const sourcesParam = requestUrl.searchParams.get("sources");
+      if (sourcesParam) {
+        try {
+          candidates = JSON.parse(sourcesParam);
+        } catch {
+          throw new AppError("BAD_REQUEST", 400, "无效的 sources 参数");
+        }
+      }
+    } else {
+      sendMethodNotAllowed(res, "GET, POST");
+      return;
+    }
+
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      throw new AppError("BAD_REQUEST", 400, "缺少候选流地址列表");
+    }
+
+    const raceResult = await race(candidates, {
+      probeSingle: true,
+      timeoutMs: config.benchmarkTimeoutMs,
+    });
+    const ranked = raceResult?.ranked ?? [];
+    const selected =
+      ranked.find((c) => c.selected && c.available !== false) ?? null;
+    sendJson(res, 200, { ok: true, data: { selected, candidates: ranked } });
+  }
+
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
     res.on("finish", () => {
@@ -341,6 +403,29 @@ export function createServer({
           return;
         }
         await handleDanmaku(res, requestUrl);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/search") {
+        if (req.method !== "GET") {
+          sendMethodNotAllowed(res, "GET");
+          return;
+        }
+        await handleSearch(res, requestUrl);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/title") {
+        if (req.method !== "GET") {
+          sendMethodNotAllowed(res, "GET");
+          return;
+        }
+        await handleTitle(res, requestUrl);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/race") {
+        await handleRace(req, res, requestUrl);
         return;
       }
 

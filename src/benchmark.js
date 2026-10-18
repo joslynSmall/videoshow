@@ -96,16 +96,21 @@ export async function raceAndSelect(candidates, options = {}) {
     return { winner: null, ranked: [] };
   }
 
-  if (candidates.length === 1) {
+  if (candidates.length === 1 && !options.probeSingle) {
     return {
       winner: candidates[0],
       ranked: [{ ...candidates[0], selected: true }],
     };
   }
 
+  const measure =
+    typeof options.benchmark === "function"
+      ? options.benchmark
+      : (candidate) => benchmarkStream(candidate.playUrl, candidate.type, options);
+
   const results = await Promise.allSettled(
     candidates.map(async (c) => {
-      const metric = await benchmarkStream(c.playUrl, c.type, options);
+      const metric = await measure(c);
       return { ...c, metric };
     }),
   );
@@ -131,15 +136,15 @@ export async function raceAndSelect(candidates, options = {}) {
       return b.metric.score - a.metric.score;
     });
 
-  const winner = ranked[0];
-  const formattedRanked = ranked.map((c, i) => ({
+  const winner = ranked.find((c) => c.metric.available) || null;
+  const formattedRanked = ranked.map((c) => ({
     provider: c.provider,
     playUrl: c.playUrl,
     type: c.type,
     speedKBps: c.metric.speedKBps,
     ttfbMs: c.metric.ttfbMs,
     available: c.metric.available,
-    selected: i === 0,
+    selected: winner !== null && c === winner,
   }));
 
   return {

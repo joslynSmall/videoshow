@@ -271,3 +271,144 @@ test("unknown API and static paths return 404", async (t) => {
   });
   assert.equal(staticResponse.status, 404);
 });
+
+test("GET /api/search validates keyword and returns items", async (t) => {
+  const { base } = await start(t, {
+    search: async (kw) => [
+      {
+        id: "abc",
+        cat: "2",
+        title: kw,
+        cover: "https://img.example/cover.jpg",
+        remarks: "电视剧 · 爱奇艺",
+        desc: "测试简介",
+        platforms: [{ id: "qiyi", name: "爱奇艺" }],
+      },
+    ],
+  });
+
+  const missingResponse = await fetch(`${base}/api/search`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  const missingBody = await missingResponse.json();
+  assert.equal(missingResponse.status, 400);
+  assert.equal(missingBody.ok, false);
+  assert.equal(missingBody.error.code, "INVALID_KEYWORD");
+
+  const { response, body } = await getJson(
+    `${base}/api/search?kw=${encodeURIComponent("狂飙")}`,
+  );
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data.items.length, 1);
+  assert.equal(body.data.items[0].title, "狂飙");
+  assert.equal(body.data.items[0].platforms[0].name, "爱奇艺");
+
+  const methodNotAllowed = await fetch(`${base}/api/search`, {
+    method: "POST",
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(methodNotAllowed.status, 405);
+});
+
+test("GET /api/title returns platform episode pages", async (t) => {
+  const { base } = await start(t, {
+    loadTitle: async (cat, id) => {
+      if (!String(cat).trim() || !String(id).trim()) {
+        throw new AppError("INVALID_TITLE", 400, "缺少剧目编号");
+      }
+      return {
+      id,
+      cat,
+      title: "狂飙",
+      platforms: [
+        {
+          id: "qiyi",
+          name: "爱奇艺",
+          episodes: [{ name: "第1集", pageUrl: "https://www.iqiyi.com/v_1.html" }],
+        },
+      ],
+    };
+    },
+  });
+
+  const missing = await fetch(`${base}/api/title?cat=2`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  const missingBody = await missing.json();
+  assert.equal(missing.status, 400);
+  assert.equal(missingBody.error.code, "INVALID_TITLE");
+
+  const { response, body } = await getJson(`${base}/api/title?cat=2&id=abc`);
+  assert.equal(response.status, 200);
+  assert.equal(body.data.platforms[0].episodes[0].pageUrl, "https://www.iqiyi.com/v_1.html");
+});
+
+test("/api/race benchmarks multiple candidate streams and returns ranked results", async (t) => {
+  const { base } = await start(t, {
+    race: async (candidates) => {
+      const ranked = candidates.map((c, idx) => {
+        const available = c.provider !== "失效源";
+        return {
+          ...c,
+          speedKBps: idx === 0 ? 3000 : 1500,
+          ttfbMs: idx === 0 ? 100 : 200,
+          available,
+          selected: available && idx === 0,
+        };
+      });
+      return { winner: ranked.find((item) => item.selected) || null, ranked };
+    },
+  });
+
+  const emptyResponse = await fetch(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ candidates: [] }),
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(emptyResponse.status, 400);
+
+  const raceResponse = await fetch(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      candidates: [
+        { provider: "源1", playUrl: "https://media1.example/1.m3u8", type: "m3u8" },
+        { provider: "源2", playUrl: "https://media2.example/2.m3u8", type: "m3u8" },
+      ],
+    }),
+    signal: AbortSignal.timeout(5000),
+  });
+  const raceBody = await raceResponse.json();
+  assert.equal(raceResponse.status, 200);
+  assert.equal(raceBody.ok, true);
+  assert.equal(raceBody.data.selected.provider, "源1");
+  assert.equal(raceBody.data.candidates.length, 2);
+
+  const deadResponse = await fetch(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      candidates: [
+        { provider: "失效源", playUrl: "https://dead.example/1.m3u8", type: "m3u8" },
+      ],
+    }),
+    signal: AbortSignal.timeout(5000),
+  });
+  const deadBody = await deadResponse.json();
+  assert.equal(deadResponse.status, 200);
+  assert.equal(deadBody.data.selected, null);
+
+  const getRaceResponse = await fetch(
+    `${base}/api/race?sources=${encodeURIComponent(
+      JSON.stringify([
+        { provider: "源1", playUrl: "https://media1.example/1.m3u8", type: "m3u8" },
+      ]),
+    )}`,
+    { signal: AbortSignal.timeout(5000) },
+  );
+  assert.equal(getRaceResponse.status, 200);
+});
+
+

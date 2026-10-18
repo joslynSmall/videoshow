@@ -34,6 +34,14 @@ const STATIC_FILES = new Map([
     },
   ],
   [
+    "/danmaku-text.js",
+    {
+      file: "danmaku-text.js",
+      type: "text/javascript; charset=utf-8",
+      cache: "no-cache",
+    },
+  ],
+  [
     "/styles.css",
     {
       file: "styles.css",

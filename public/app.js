@@ -1,3 +1,29 @@
+import { splitDanmakuText } from "/danmaku-text.js";
+
+window.renderArtDanmaku = function renderArtDanmaku(item) {
+  const el = item?.$ref;
+  if (!el) return;
+  const parts = splitDanmakuText(item.text);
+  if (!parts.some((part) => part.type === "image")) {
+    el.textContent = item.text || "";
+    return;
+  }
+  el.replaceChildren();
+  for (const part of parts) {
+    if (part.type === "text") {
+      if (part.value) el.append(document.createTextNode(part.value));
+      continue;
+    }
+    const img = document.createElement("img");
+    img.alt = "";
+    img.draggable = false;
+    img.referrerPolicy = "no-referrer";
+    img.src = part.src;
+    img.style.cssText = "height:1.4em;width:1.4em;object-fit:contain;vertical-align:middle;";
+    el.append(img);
+  }
+};
+
 (() => {
   const form = document.querySelector("#parse-form");
   const input = document.querySelector("#url-input");
@@ -301,19 +327,77 @@
 
       const BaseLoader = window.Hls.DefaultConfig?.loader;
       const loader = BaseLoader
-        ? class ProxyMediaLoader extends BaseLoader {
+        ? class MediaLoader extends BaseLoader {
+            constructor(config) {
+              super(config);
+              this.loaderOptions = config;
+              this.fallback = null;
+            }
+
             load(context, config, callbacks) {
               const original = context?.url;
-              if (typeof original === "string" && /^https?:\/\//i.test(original)) {
-                try {
-                  if (new URL(original).origin !== location.origin) {
-                    context.url = `${location.origin}/api/media?url=${encodeURIComponent(original)}`;
-                  }
-                } catch {
-                  // 地址无法解析时保持原请求，让播放器按失败处理。
-                }
+              let crossOrigin = false;
+              try {
+                crossOrigin =
+                  typeof original === "string" &&
+                  /^https?:\/\//i.test(original) &&
+                  new URL(original).origin !== location.origin;
+              } catch {
+                crossOrigin = false;
               }
-              super.load(context, config, callbacks);
+              if (!crossOrigin) {
+                super.load(context, config, callbacks);
+                return;
+              }
+
+              // 浏览器到源站通常是通的。先直连，超时或失败再交给本站中转。
+              let settled = false;
+              const useProxy = () => {
+                if (settled) return;
+                settled = true;
+                try {
+                  this.abortInternal();
+                } catch {
+                  // 直连已经结束时忽略。
+                }
+                context.url = `${location.origin}/api/media?url=${encodeURIComponent(original)}`;
+                const next = new BaseLoader(this.loaderOptions);
+                this.fallback = next;
+                next.load(context, config, callbacks);
+              };
+              const policy = config?.loadPolicy;
+              const directConfig = policy
+                ? {
+                    ...config,
+                    timeout: 4000,
+                    loadPolicy: {
+                      ...policy,
+                      maxTimeToFirstByteMs: 4000,
+                      maxLoadTimeMs: 8000,
+                      timeoutRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
+                      errorRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
+                    },
+                  }
+                : config;
+              super.load(context, directConfig, {
+                onSuccess: (...args) => {
+                  settled = true;
+                  callbacks.onSuccess?.(...args);
+                },
+                onProgress: (...args) => callbacks.onProgress?.(...args),
+                onError: () => useProxy(),
+                onTimeout: () => useProxy(),
+              });
+            }
+
+            abort() {
+              this.fallback?.abort();
+              super.abort();
+            }
+
+            destroy() {
+              this.fallback?.destroy();
+              super.destroy();
             }
           }
         : undefined;

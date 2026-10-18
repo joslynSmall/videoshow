@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeDmkuResponse } from "../src/danmaku.js";
+import { splitDanmakuText } from "../public/danmaku-text.js";
 
 test("normalizeDmkuResponse filters dirty items and maps modes", () => {
   const result = normalizeDmkuResponse({
@@ -27,6 +28,24 @@ test("normalizeDmkuResponse filters dirty items and maps modes", () => {
   assert.equal(result.items[1].mode, 2);
   assert.equal(result.items[2].mode, 1);
   assert.equal(result.items[2].color, "#FF0000");
+});
+
+test("splitDanmakuText turns image markup into image parts", () => {
+  const parts = splitDanmakuText(
+    '好图<img src="https://img.example/a.png" width="20">[img]https://img.example/b.webp[/img]',
+  );
+  assert.deepEqual(parts, [
+    { type: "text", value: "好图" },
+    { type: "image", src: "https://img.example/a.png" },
+    { type: "image", src: "https://img.example/b.webp" },
+  ]);
+});
+
+test("splitDanmakuText drops non-https image sources", () => {
+  const parts = splitDanmakuText(
+    '<img src="javascript:alert(1)"><img src="http://img.example/a.png">普通',
+  );
+  assert.deepEqual(parts, [{ type: "text", value: "普通" }]);
 });
 
 test("normalizeDmkuResponse returns an empty collection for no data", () => {

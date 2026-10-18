@@ -292,6 +292,24 @@ test("unknown API and static paths return 404", async (t) => {
   assert.equal(staticResponse.status, 404);
 });
 
+test("GET /api/site-search returns only sites that have pages", async (t) => {
+  const { base } = await start(t, {
+    searchSitesFn: async () => [
+      {
+        id: "qq",
+        name: "腾讯视频",
+        items: [{ title: "繁花", pageUrl: "https://v.qq.com/x/cover/abc.html", cover: "", remarks: "", desc: "" }],
+      },
+    ],
+  });
+  const { response, body } = await getJson(
+    `${base}/api/site-search?kw=${encodeURIComponent("繁花")}`,
+  );
+  assert.equal(response.status, 200);
+  assert.equal(body.data.sites[0].id, "qq");
+  assert.equal(body.data.sites[0].items[0].title, "繁花");
+});
+
 test("GET /api/search validates keyword and returns items", async (t) => {
   const { base } = await start(t, {
     search: async (kw) => [

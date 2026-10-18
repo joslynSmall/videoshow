@@ -23,3 +23,7 @@ _Avoid_: Splash Area, Top Banner, Giant Hero
 **Stream Validation**:
 Content-based protocol and payload verification ensuring media streams are playable prior to client handoff.
 _Avoid_: Link Ping, Reachability Check
+
+**Platform Page Search**:
+Discovery of an official watch page on a domestic video site when a title is absent from the catalog.
+_Avoid_: Site scrape, Web fallback, Direct resolution

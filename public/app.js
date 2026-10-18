@@ -49,6 +49,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   const searchSection = document.querySelector("#search-section");
   const searchGrid = document.querySelector("#search-grid");
   const searchCount = document.querySelector("#search-count");
+  const siteSearchModal = document.querySelector("#site-search-modal");
+  const siteSearchTabs = document.querySelector("#site-search-tabs");
+  const siteSearchList = document.querySelector("#site-search-list");
+  const closeSiteSearchBtn = document.querySelector("#close-site-search");
 
   const episodesBar = document.querySelector("#episodes-bar");
   const platformBar = document.querySelector("#platform-bar");
@@ -934,6 +938,147 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return payload.data?.items || [];
   }
 
+  async function searchSites(keyword) {
+    const response = await fetch(`/api/site-search?kw=${encodeURIComponent(keyword)}`, {
+      headers: { accept: "application/json" },
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (err) {
+      console.warn("site search response was not JSON", err);
+    }
+    if (!response.ok || !payload || payload.ok !== true) return [];
+    return Array.isArray(payload.data?.sites) ? payload.data.sites : [];
+  }
+
+  async function loadEpisodes(pageUrl) {
+    const response = await fetch(`/api/episodes?url=${encodeURIComponent(pageUrl)}`, {
+      headers: { accept: "application/json" },
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (err) {
+      console.warn("episodes response was not JSON", err);
+    }
+    if (!response.ok || !payload?.ok || !Array.isArray(payload.data?.episodes)) return [];
+    return payload.data.episodes;
+  }
+
+  function samePage(left, right) {
+    try {
+      const a = new URL(left);
+      const b = new URL(right);
+      return a.host === b.host && a.pathname === b.pathname;
+    } catch {
+      return false;
+    }
+  }
+
+  async function withEpisodes(pageUrl, data, fallback = []) {
+    let episodes = Array.isArray(fallback) && fallback.length > 1 ? fallback : [];
+    if (episodes.length < 2) episodes = await loadEpisodes(pageUrl);
+    if (episodes.length < 2) return data;
+    const episodeIndex = Math.max(0, episodes.findIndex((episode) => samePage(episode.pageUrl, pageUrl)));
+    return {
+      ...data,
+      episodes,
+      episodeIndex,
+      episodeName: episodes[episodeIndex]?.name || data.episodeName || "",
+    };
+  }
+
+  function closeSiteSearch() {
+    if (siteSearchModal) siteSearchModal.hidden = true;
+  }
+
+  function renderSiteResults(site) {
+    if (!siteSearchList) return;
+    siteSearchList.replaceChildren();
+    for (const item of site?.items || []) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "site-result";
+      const img = document.createElement("img");
+      img.alt = "";
+      img.src = item.cover || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 54 72'%3E%3Crect width='54' height='72' fill='%23171b18'/%3E%3C/svg%3E";
+      const copy = document.createElement("div");
+      const title = document.createElement("h4");
+      title.textContent = item.title || "未命名";
+      const meta = document.createElement("p");
+      meta.textContent = [item.remarks, item.desc].filter(Boolean).join(" · ");
+      copy.append(title, meta);
+      button.append(img, copy);
+      button.addEventListener("click", () => {
+        playSiteItem(item);
+      });
+      siteSearchList.append(button);
+    }
+  }
+
+  async function playSiteItem(item) {
+    const episodes = Array.isArray(item?.episodes) ? item.episodes : [];
+    const pageUrl = episodes[0]?.pageUrl || item?.pageUrl;
+    if (!pageUrl) return;
+    closeSiteSearch();
+    input.value = pageUrl;
+    if (clearInputBtn) clearInputBtn.hidden = false;
+    currentMedia = {
+      id: item.pageUrl || pageUrl,
+      baseTitle: item.title,
+      title: item.title,
+      cover: item.cover || "",
+      sourceUrl: pageUrl,
+      episodeName: episodes[0]?.name || "",
+      episodeIndex: 0,
+      platforms: [],
+      platformId: "",
+      episodes,
+    };
+    setLoading(true);
+    setStatus("正在解析视频链接，请稍候…", "loading");
+    searchSection.hidden = true;
+    try {
+      const data = await withEpisodes(pageUrl, await parse(pageUrl), episodes);
+      const episodeIndex = data.episodeIndex || 0;
+      showResult({
+        ...data,
+        title: item.title,
+        baseTitle: item.title,
+        cover: item.cover || data.cover || "",
+        episodeName: data.episodeName || episodes[episodeIndex]?.name || "",
+        episodeIndex,
+        episodes: data.episodes,
+      });
+      setStatus("解析成功。", "");
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "解析失败，请稍后重试。", "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function openSiteSearch(sites) {
+    if (!siteSearchModal || !siteSearchTabs || !sites.length) return;
+    siteSearchTabs.replaceChildren();
+    sites.forEach((site, index) => {
+      const tab = document.createElement("button");
+      tab.type = "button";
+      tab.className = `site-tab${index === 0 ? " is-active" : ""}`;
+      tab.textContent = site.name;
+      tab.addEventListener("click", () => {
+        for (const node of siteSearchTabs.querySelectorAll(".site-tab")) {
+          node.classList.toggle("is-active", node === tab);
+        }
+        renderSiteResults(site);
+      });
+      siteSearchTabs.append(tab);
+    });
+    renderSiteResults(sites[0]);
+    siteSearchModal.hidden = false;
+  }
+
   async function loadTitle(cat, id) {
     const response = await fetch(
       `/api/title?cat=${encodeURIComponent(cat)}&id=${encodeURIComponent(id)}`,
@@ -1074,7 +1219,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       setStatus("正在解析视频链接，请稍候…", "loading");
       searchSection.hidden = true;
       try {
-        const data = await parse(query);
+        const data = await withEpisodes(query, await parse(query));
         showResult(data);
         setStatus("解析成功。", "");
       } catch (err) {
@@ -1091,7 +1236,18 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       try {
         const items = await search(query);
         renderSearchResults(items);
-        setStatus(items.length ? "搜索完成，请选择剧目观看。" : "未找到相关影视资源。", "");
+        if (items.length) {
+          setStatus("搜索完成，请选择剧目观看。", "");
+        } else {
+          setStatus("目录没有结果，正在查找视频网站…", "loading");
+          const sites = await searchSites(query);
+          if (sites.length) {
+            openSiteSearch(sites);
+            setStatus("目录没有这部，请从视频网站的结果里选择。", "");
+          } else {
+            setStatus("未找到相关影视资源。", "");
+          }
+        }
       } catch (err) {
         setStatus(
           err instanceof Error ? err.message : "搜索失败，请稍后重试。",
@@ -1153,6 +1309,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       historyModal.hidden = true;
     });
   }
+
+  closeSiteSearchBtn?.addEventListener("click", closeSiteSearch);
+  siteSearchModal?.addEventListener("click", (event) => {
+    if (event.target === siteSearchModal) closeSiteSearch();
+  });
 
   if (clearHistoryBtn) {
     clearHistoryBtn.addEventListener("click", () => {

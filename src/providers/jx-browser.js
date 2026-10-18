@@ -108,15 +108,19 @@ export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
 
     let playUrl = null;
 
+    const acceptMediaUrl = (raw) => {
+      if (typeof raw !== "string" || !/^https?:\/\//i.test(raw)) return "";
+      if (/54188\.sb|_player\/play/i.test(raw)) return "";
+      if (!/\.(m3u8|mp4)(\?|$)/i.test(raw)) return "";
+      return raw;
+    };
+
     pageWs.addEventListener("message", (event) => {
       const msg = JSON.parse(event.data);
       if (msg.method === "Network.requestWillBeSent") {
-        const u = msg.params?.request?.url || "";
-        if (/sviptq\.com[^\s"']+\.m3u8/i.test(u)) {
-          playUrl = u;
-        } else if (!playUrl && /\.m3u8/i.test(u) && !/54188\.sb/i.test(u)) {
-          playUrl = u;
-        }
+        const found = acceptMediaUrl(msg.params?.request?.url || "");
+        if (!found) return;
+        if (/sviptq\.com.+\.m3u8/i.test(found) || !playUrl) playUrl = found;
       }
     });
 
@@ -133,10 +137,8 @@ export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
           expression: "window.FFSir?.dp?.options?.video?.url || ''",
           returnByValue: true,
         });
-        const val = evalRes?.result?.value;
-        if (val && typeof val === "string" && /^https?:\/\//i.test(val) && !/54188\.sb/i.test(val)) {
-          if (!playUrl) playUrl = val;
-        }
+        const val = acceptMediaUrl(evalRes?.result?.value);
+        if (val && !playUrl) playUrl = val;
       } catch {}
 
       if (playUrl && Date.now() - start > 5000) {

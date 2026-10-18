@@ -13,6 +13,7 @@ import { enrichMetadata } from "./metadata.js";
 import { normalizeVideoUrl, resolveStream } from "./provider.js";
 import { resolveWithBrowser } from "./providers/jx-browser.js";
 import { loadCatalogTitle, searchCatalog } from "./catalog.js";
+import { loadPageEpisodes, searchSites } from "./sites/index.js";
 import { openMedia } from "./media.js";
 import { extractExpiry, normalizeType, validateStream } from "./stream.js";
 
@@ -193,6 +194,8 @@ export function createServer({
   enrich = enrichMetadata,
   fetchDanmaku = fetchDmkuDanmaku,
   search = searchCatalog,
+  searchSitesFn = searchSites,
+  loadEpisodesFn = loadPageEpisodes,
   loadTitle = loadCatalogTitle,
   openMediaFn = openMedia,
   race = raceAndSelect,
@@ -351,6 +354,36 @@ export function createServer({
       count: items.length,
     });
     sendJson(res, 200, { ok: true, data: { items } });
+  }
+
+  async function handleSiteSearch(res, requestUrl) {
+    const kw =
+      requestUrl.searchParams.get("kw") ||
+      requestUrl.searchParams.get("q") ||
+      "";
+    if (!kw.trim()) {
+      throw new AppError("INVALID_KEYWORD", 400, "缺少搜索关键词");
+    }
+    const sites = await searchSitesFn(kw.trim());
+    logger.info("site_search.completed", {
+      keyword: kw.trim().slice(0, 80),
+      sites: sites.map((site) => site.id).join(","),
+      count: sites.reduce((sum, site) => sum + site.items.length, 0),
+    });
+    sendJson(res, 200, { ok: true, data: { sites } });
+  }
+
+  async function handleEpisodes(res, requestUrl) {
+    const pageUrl = requestUrl.searchParams.get("url") || "";
+    if (!pageUrl.trim()) {
+      throw new AppError("BAD_REQUEST", 400, "缺少视频页面地址");
+    }
+    const episodes = await loadEpisodesFn(pageUrl.trim());
+    logger.info("episodes.loaded", {
+      host: hostOf(pageUrl),
+      count: episodes.length,
+    });
+    sendJson(res, 200, { ok: true, data: { episodes } });
   }
 
   async function handleMedia(req, res, requestUrl) {
@@ -524,6 +557,24 @@ export function createServer({
           return;
         }
         await handleSearch(res, requestUrl);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/episodes") {
+        if (req.method !== "GET") {
+          sendMethodNotAllowed(res, "GET");
+          return;
+        }
+        await handleEpisodes(res, requestUrl);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/site-search") {
+        if (req.method !== "GET") {
+          sendMethodNotAllowed(res, "GET");
+          return;
+        }
+        await handleSiteSearch(res, requestUrl);
         return;
       }
 

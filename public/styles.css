@@ -621,6 +621,70 @@ input {
   line-height: 1.4;
 }
 
+.site-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 0 16px 12px;
+}
+
+.site-tab {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.site-tab.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.site-search-list {
+  display: grid;
+  gap: 8px;
+  max-height: 52vh;
+  overflow: auto;
+  padding: 0 16px 16px;
+}
+
+.site-result {
+  display: grid;
+  grid-template-columns: 54px 1fr;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: inherit;
+  border-radius: 12px;
+  padding: 8px;
+  cursor: pointer;
+}
+
+.site-result img {
+  width: 54px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #171b18;
+}
+
+.site-result h4 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.site-result p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* 模态弹窗系统 */
 .modal-backdrop {
   position: fixed;

@@ -34,7 +34,18 @@ export const config = {
       .map((id) => id.trim())
       .filter(Boolean),
   httpProviderTimeoutMs: intEnv("HTTP_PROVIDER_TIMEOUT_MS", 12000),
-  chromeBin: process.env.CHROME_BIN || "/usr/bin/google-chrome",
+  parseGraceMs: intEnv("PARSE_GRACE_MS", 3000),
+  channelConfigUrl: process.env.CHANNEL_CONFIG_URL || "",
+  channelConfigRefreshMs: intEnv("CHANNEL_CONFIG_REFRESH_MS", 600000),
+  // 渠道健康账本的落盘位置；Serverless 环境文件系统不可持久，默认只用内存。设为空字符串可关闭落盘。
+  channelStateFile: process.env.CHANNEL_STATE_FILE !== undefined
+    ? process.env.CHANNEL_STATE_FILE
+    : process.env.VERCEL
+      ? ""
+      : path.join(projectRoot, "data", "channel-state.json"),
+  channelDeadDays: intEnv("CHANNEL_DEAD_DAYS", 3),
+  channelMinDailyAttempts: intEnv("CHANNEL_MIN_DAILY_ATTEMPTS", 3),
+  channelTimezone: process.env.CHANNEL_TIMEZONE || "",
   benchmarkTimeoutMs: intEnv("BENCHMARK_TIMEOUT_MS", 3000),
   requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15000),
   metadataTimeoutMs: intEnv("METADATA_TIMEOUT_MS", 5000),
@@ -50,6 +61,24 @@ export const config = {
   cacheMaxEntries: intEnv("CACHE_MAX_ENTRIES", 200),
   publicDir: path.join(projectRoot, "public"),
 };
+
+if (config.channelConfigUrl) {
+  let url;
+  try {
+    url = new URL(config.channelConfigUrl);
+  } catch {
+    throw new Error("CHANNEL_CONFIG_URL must be a valid URL");
+  }
+  if (url.protocol !== "https:") throw new Error("CHANNEL_CONFIG_URL must use https");
+}
+
+if (config.channelTimezone) {
+  try {
+    new Intl.DateTimeFormat("en-CA", { timeZone: config.channelTimezone });
+  } catch {
+    throw new Error("CHANNEL_TIMEZONE must be a valid IANA time zone");
+  }
+}
 
 if (!["system", "public", "auto"].includes(config.mediaDnsMode)) {
   throw new Error("MEDIA_DNS_MODE must be system, public, or auto");

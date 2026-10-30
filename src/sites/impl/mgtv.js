@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { fetchText } from "../../http.js";
+import { chromeBin, chromeDataDir, chromeProxyArgs, killChrome, removeChromeDir } from "../../providers/chrome.js";
 import { defineSite } from "../contract.js";
 import { httpsPage, plainText, uniqueItems } from "./shared.js";
 
@@ -75,14 +76,16 @@ export function mapMgtvPage(html) {
   return uniqueItems(items);
 }
 
-function chromeBin() {
-  const bin = process.env.CHROME_BIN || "/usr/bin/google-chrome";
+function installedChrome() {
+  const bin = chromeBin();
   return fs.existsSync(bin) ? bin : "";
 }
 
 export function renderMgtvSearchPage(url, timeoutMs = 12000) {
-  const bin = chromeBin();
+  const bin = installedChrome();
   if (!bin) return Promise.resolve("");
+  // 独立 profile：Windows 上已有 Chrome 在运行时，共用默认 profile 会把请求转交给旧实例并立即退出。
+  const dataDir = chromeDataDir("vs-mgtv");
   return new Promise((resolve) => {
     const child = spawn(
       bin,
@@ -91,8 +94,10 @@ export function renderMgtvSearchPage(url, timeoutMs = 12000) {
         "--disable-gpu",
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--user-data-dir=" + dataDir,
         "--virtual-time-budget=8000",
         `--timeout=${Math.max(8000, timeoutMs)}`,
+        ...chromeProxyArgs(),
         "--dump-dom",
         url,
       ],
@@ -104,10 +109,11 @@ export function renderMgtvSearchPage(url, timeoutMs = 12000) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      void removeChromeDir(dataDir, child);
       resolve(html);
     };
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killChrome(child, "SIGKILL");
       finish(Buffer.concat(chunks).toString("utf8"));
     }, timeoutMs);
     child.stdout.on("data", (chunk) => chunks.push(chunk));
@@ -144,10 +150,7 @@ export function mgtvVideoId(pageUrl) {
 
 function mgtvEpisodeName(row) {
   const index = plainText(row?.t1);
-  const label = plainText(row?.t4);
-  if (/^\d+$/.test(index)) return `第${index}集`;
-  if (index) return index;
-  return label;
+  return /^\d+$/.test(index) ? `第${index}集` : "";
 }
 
 export function mapMgtvEpisodes(payload) {
@@ -156,6 +159,8 @@ export function mapMgtvEpisodes(payload) {
   const episodes = [];
   const seen = new Set();
   for (const row of rows) {
+    // isIntact=1 才是完整正片；3 是看点预告（沿用正片集号），5 番外、7 彩蛋、12 番综。
+    if (row?.isIntact !== undefined && String(row.isIntact) !== "1") continue;
     const raw = typeof row?.url === "string" ? row.url : "";
     const absolute = raw.startsWith("/") ? `https://www.mgtv.com${raw}` : raw;
     const pageUrl = httpsPage(absolute, "mgtv.com").split("?")[0];

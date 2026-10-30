@@ -29,6 +29,34 @@ export const HTTP_CHANNELS = Object.freeze([
   },
 ]);
 
+// 可由外部配置引用的解析器。generic 没有专用解析函数，按页面里的媒体地址或重定向地址提取。
+export const HTTP_PARSERS = Object.freeze({
+  lx: resolveLxResponse,
+  "jiexi789-page": resolveJiexi789PageResponse,
+  bingdou: resolveBingdouResponse,
+  qilin: resolvePlayerConfigResponse,
+  generic: null,
+});
+
+// 只有这里登记过的渠道对象才允许被 resolveHttpChannel 请求：
+// 代码里的内置渠道，以及经过校验后由外部配置构造的渠道。
+const registeredChannels = new WeakSet(HTTP_CHANNELS);
+
+export function createHttpChannel({ id, name, endpoint, parser = "generic", singleUse = false, fallback = false }) {
+  if (!Object.hasOwn(HTTP_PARSERS, parser)) throw new Error(`Unknown parser: ${parser}`);
+  const channel = Object.freeze({
+    id,
+    name,
+    endpoint,
+    parser,
+    ...(HTTP_PARSERS[parser] ? { resolveResponse: HTTP_PARSERS[parser] } : {}),
+    ...(singleUse ? { singleUse: true } : {}),
+    ...(fallback ? { fallback: true } : {}),
+  });
+  registeredChannels.add(channel);
+  return channel;
+}
+
 const MAX_RESPONSE_BYTES = 256 * 1024;
 
 function mediaUrl(value) {
@@ -149,7 +177,7 @@ async function readPage(url, timeoutMs, options = {}) {
 }
 
 export async function resolveHttpChannel(channel, sourceUrl, options = {}) {
-  if (!HTTP_CHANNELS.includes(channel)) {
+  if (!registeredChannels.has(channel)) {
     throw new AppError("CONFIG_ERROR", 500, "未注册的解析渠道");
   }
   const deadline = performance.now() + (options.timeoutMs ?? 8000);

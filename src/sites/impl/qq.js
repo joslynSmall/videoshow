@@ -53,31 +53,95 @@ export function qqCoverId(pageUrl) {
   return String(pageUrl || "").match(/\/x\/cover\/([0-9a-z]+)/i)?.[1] || "";
 }
 
-export function mapQqEpisodeIds(cid, videoIds) {
-  if (!cid || !Array.isArray(videoIds)) return [];
+const QQ_PAGE_DATA_URL =
+  "https://pbaccess.video.qq.com/trpc.universal_backend_service.page_server_rpc.PageServer/GetPageData?video_appid=3000010&vplatform=2&vversion_name=8.2.96";
+const QQ_MAX_TABS = 20;
+
+function qqEpisodeModule(payload) {
+  const groups = payload?.data?.module_list_datas;
+  if (!Array.isArray(groups)) return null;
+  for (const group of groups) {
+    for (const module of Array.isArray(group?.module_datas) ? group.module_datas : []) {
+      if (module?.module_params?.desk_module_type === "episode_list") return module;
+    }
+  }
+  return null;
+}
+
+export function qqEpisodeRows(payload) {
+  const items = qqEpisodeModule(payload)?.item_data_lists?.item_datas;
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => item?.item_params).filter(Boolean);
+}
+
+export function qqEpisodeTabs(payload) {
+  try {
+    const tabs = JSON.parse(qqEpisodeModule(payload)?.module_params?.tabs || "[]");
+    return Array.isArray(tabs) ? tabs.filter((tab) => !tab?.selected && tab?.page_context) : [];
+  } catch {
+    return [];
+  }
+}
+
+// 只有标题为纯数字的才是正片；预告、彩蛋、番外、海报的标题都是文字。
+export function mapQqEpisodes(cid, rows) {
+  if (!cid || !Array.isArray(rows)) return [];
   const episodes = [];
   const seen = new Set();
-  for (const vid of videoIds) {
+  for (const row of rows) {
+    const number = plainText(row?.title);
+    const vid = plainText(row?.vid);
+    if (!/^\d+$/.test(number) || !vid) continue;
     const pageUrl = coverPage(`https://v.qq.com/x/cover/${cid}/${vid}.html`);
     if (!pageUrl || seen.has(pageUrl)) continue;
     seen.add(pageUrl);
-    episodes.push({ name: `第${episodes.length + 1}集`, pageUrl });
+    episodes.push({ name: `第${number}集`, pageUrl });
   }
   return episodes;
+}
+
+function fetchQqEpisodePage(cid, options, params = {}) {
+  return options.fetchJsonFn(QQ_PAGE_DATA_URL, {
+    method: "POST",
+    timeoutMs: options.timeoutMs,
+    accept: "application/json",
+    headers: {
+      "content-type": "application/json",
+      origin: "https://v.qq.com",
+      referer: "https://v.qq.com/",
+    },
+    body: JSON.stringify({
+      page_params: {
+        req_from: "web_vsite",
+        page_id: "vsite_episode_list",
+        page_type: "detail_operation",
+        id_type: "1",
+        page_size: "100",
+        cid,
+        vid: "",
+        lid: "0",
+        page_num: "0",
+        page_context: `cid=${cid}&detail_page_type=1&req_from=web_vsite&req_from_second_type=&req_type=0`,
+        detail_page_type: "1",
+        ...params,
+      },
+      has_cache: 1,
+    }),
+  });
 }
 
 export async function loadQqEpisodes(pageUrl, options = {}) {
   const cid = qqCoverId(pageUrl);
   if (!cid) return [];
-  const payload = await options.fetchJsonFn(
-    `https://node.video.qq.com/x/api/float_vinfo2?cid=${encodeURIComponent(cid)}`,
-    {
-      timeoutMs: options.timeoutMs,
-      accept: "application/json",
-      headers: { referer: "https://v.qq.com/" },
-    },
+  const first = await fetchQqEpisodePage(cid, options);
+  const rest = await Promise.all(
+    qqEpisodeTabs(first)
+      .slice(0, QQ_MAX_TABS)
+      .map((tab) =>
+        fetchQqEpisodePage(cid, options, { page_context: tab.page_context, page_num: "1", page_size: "30" }),
+      ),
   );
-  return mapQqEpisodeIds(cid, payload?.c?.video_ids);
+  return mapQqEpisodes(cid, [first, ...rest].flatMap(qqEpisodeRows));
 }
 
 export async function searchQq(keyword, options = {}) {

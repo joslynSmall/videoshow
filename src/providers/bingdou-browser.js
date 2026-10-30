@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { AppError } from "../errors.js";
+import { chromeBin, chromeDataDir, chromeProxyArgs, killChrome, removeChromeDir } from "./chrome.js";
 
-const CHROME_PATH = process.env.CHROME_BIN || "/usr/bin/google-chrome";
 const PLAYER_ENDPOINT = "https://jiexi.bot.cd/jx/?url=";
 const FINAL_HOST = "123.129.229.14:4433";
 
@@ -71,16 +71,14 @@ async function waitForValue(pageSend, expression, timeoutMs) {
 }
 
 export async function resolveBingdouWithBrowser(sourceUrl, { timeoutMs = 30000 } = {}) {
-  if (!fs.existsSync(CHROME_PATH)) {
+  const chromePath = chromeBin();
+  if (!fs.existsSync(chromePath)) {
     throw new AppError("BROWSER_UNAVAILABLE", 503, "无头 Chrome 未安装");
   }
 
-  const dataDir = path.join(
-    "/tmp",
-    "vs-bingdou-" + Date.now() + "-" + Math.random().toString(36).slice(2),
-  );
+  const dataDir = chromeDataDir("vs-bingdou");
   fs.mkdirSync(dataDir, { recursive: true });
-  const chrome = spawn(CHROME_PATH, [
+  const chrome = spawn(chromePath, [
     "--headless=new",
     "--no-sandbox",
     "--disable-gpu",
@@ -90,6 +88,7 @@ export async function resolveBingdouWithBrowser(sourceUrl, { timeoutMs = 30000 }
     "--ignore-certificate-errors",
     "--user-data-dir=" + dataDir,
     "--remote-debugging-port=0",
+    ...chromeProxyArgs(),
     "about:blank",
   ], { stdio: "ignore" });
 
@@ -97,8 +96,8 @@ export async function resolveBingdouWithBrowser(sourceUrl, { timeoutMs = 30000 }
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
-    try { chrome.kill("SIGKILL"); } catch {}
-    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch {}
+    killChrome(chrome, "SIGKILL");
+    void removeChromeDir(dataDir, chrome);
   };
 
   let browserWs;

@@ -164,6 +164,87 @@ curl -s 'http://127.0.0.1:3000/api/parse?url=https%3A%2F%2Fwww.bilibili.com%2Fvi
 `data.filtered` 给出候选过滤情况：`total`、`excluded`、`expired`、`remaining`。
 无剩余候选时客户端会重新解析一次，以刷新单次签名地址。
 已验证候选会重新测速；单次链接候选直接返回，不发起媒体请求，避免消耗签名。
+测速评分 `score` 以吞吐为主、首字节为辅：`speedKBps / (1 + ttfbSeconds)`。
+
+请求体还可带两个域名列表（各最多 20 项，用于避免在同一个失效的 CDN 域名上反复重试）：
+
+- `avoidHosts`：失败过 1 次的域名。换线时其他域名的候选优先，没有别的选择时仍可退回重试。
+- `blockedHosts`：已失败 2 次的域名，其候选直接排除，计入 `data.filtered.hostBlocked`。
+
+选择顺序为：未失败域名的已验证线路 > 未失败域名的单次链接 > 失败域名的已验证线路 > 失败域名的单次链接。
+
+`/api/parse` 不再等所有渠道跑完：拿到第一条可用的已验证线路后，再等 `PARSE_GRACE_MS` 就响应，
+仍在运行的渠道在响应的 `diagnostics` 里标为 `background`，完成后补进缓存，供 `/api/race` 换线使用。
+只有单次链接、没有已验证线路时仍会等到所有主渠道结束。
+
+### 卡顿判定与自动换线
+
+前端每 500ms 采样一次播放状态，判定逻辑集中在 `public/stall-monitor.js`（纯函数，有单元测试）：
+
+| 层 | 判定 | 动作 |
+|---|---|---|
+| 起播失败 | 10 秒内没有数据（暂停时只看元数据，播放时看能否连续播放） | 换线 |
+| 硬卡死 | 播放中连续断流 5 秒 | 换线；断流满 3 秒时先自救一次（降一档清晰度、让 HLS 重新拉分片） |
+| 慢性卡顿 | 60 秒窗口内卡顿 ≥3 次（单次 ≥1 秒），或 ≥2 次且卡顿占比 ≥15% | 换线，且换线后 30 秒内不因此再换 |
+
+暂停、拖动进度条（含之后 3 秒宽限）、断网、播放结束都不算线路卡顿。
+换线最多尝试 8 次；新线路 12 秒内没有出数据、或加载中出现 HLS 致命错误，都会立即视为本次尝试失败并换下一个候选。
+
+### 拼接广告过滤
+
+部分聚合解析渠道会把广告分片夹在两个 `#EXT-X-DISCONTINUITY` 之间拼进播放列表（例如腾讯视频 7:24 处插入 6 个来自 `askutrc5ss.com`、共约 18 秒的分片）。前端在 hls.js 拿到播放列表后、解析之前把这类块去掉，逻辑集中在 `public/ad-filter.js`（纯函数，有单元测试）。判定刻意保守，一个块要同时满足：
+
+- 夹在 DISCONTINUITY 之间，且域名族（`omts.tc.qq.com` 与 `apd.tc.qq.com` 都算 `qq.com`）不同于占时长最多的那一族；
+- 时长不超过 120 秒，块内没有 `KEY` / `MAP` / `BYTERANGE`；
+- 整份列表是完整点播列表（有 `#EXT-X-ENDLIST`，不是主列表）。
+
+候选块超过 5 个，或合计超过总时长 10%，整份列表都不动。移除后会在页面开发日志写一条"广告片段已移除"，含块数、秒数、位置和广告域名。出现误判时，在浏览器控制台执行 `localStorage.setItem("videoshow.adFilter", "off")` 即可关闭。
+
+只对 hls.js 播放有效；Safari 原生 HLS 路径拿不到播放列表，无法过滤。
+
+### 渠道健康与外部配置
+
+**自动摘除**：每次解析都会把各渠道的结果按自然日记入账本（落盘，重启不丢）。一个自然日算"不可用"，需同时满足：
+
+1. 这一天已经结束（当天不下结论）；
+2. 当天至少尝试了 `CHANNEL_MIN_DAILY_ATTEMPTS` 次；
+3. 当天没有一次可用结果；
+4. 当天至少有另一个渠道成功过。否则是断网、代理故障这类整体问题，不怪渠道。
+
+不可用的天数**累计**（不要求连续）达到 `CHANNEL_DEAD_DAYS` 就摘除，只保留最近 30 个自然日的记录。
+"可用"指产出了可用线路（含未测速、单次链接、与其他渠道地址重复）；没装 Chrome、DevTools 起不来这类本机问题不计入。
+摘除后该渠道不再被调用，`GET /api/channels` 可查看每个渠道的状态、今日尝试/成功次数和摘除原因（不含渠道地址）。
+
+**复活**：被摘除的渠道，外部配置给了**新的 endpoint**，或把 `revision` 调大，就会重新启用并重新累计；
+地址不变的重复配置不会让它复活。没有地址的内置渠道（`jiexi789`、`jx-browser`）只能靠 `revision`。
+
+**外部配置**（`CHANNEL_CONFIG_URL`）返回：
+
+```json
+{
+  "channels": [
+    { "id": "lx", "endpoint": "https://jx.example.com/index.php?url=", "revision": 1 },
+    { "id": "extra", "name": "新增渠道", "endpoint": "https://extra.example.com/?url=", "parser": "generic", "singleUse": false },
+    { "id": "qilin", "enabled": false }
+  ]
+}
+```
+
+- 同 `id` 的内置渠道可改 `name`、`endpoint`、`parser`、`singleUse`、`fallback`，没写的字段保持原样；新渠道必须有 `endpoint`。
+- `parser` 取值：`lx`、`jiexi789-page`、`bingdou`、`qilin`、`generic`（默认；按页面里的媒体地址或重定向提取）。
+- `enabled: false` 停用渠道，包括 `jiexi789`、`jx-browser`；条目不在配置里则恢复内置行为。
+- `endpoint` 会被服务端当作请求目标，所以只接受：https、无账号密码、默认端口、非 IP、非内网域名、以 `=` 结尾（用于拼接视频地址）。
+  不合法的条目会被单独丢弃并记入日志和 `/api/channels`，不影响其他条目；配置体最大 64KB、最多 32 个渠道。
+
+### 线路筛选与失败判定
+
+- **单次链接先查 DNS**：单次签名链接不能预先请求（会消耗签名），但解析阶段会只查一次公共 DNS，
+  域名已不存在（NXDOMAIN）的直接剔除，诊断里标为 `HOST_UNREACHABLE`，不必等起播超时。查不出结论时保留。
+- **测速没跑完 ≠ 不可用**：已通过内容校验的线路，如果测速因超时、网络错误或服务端 DNS 校验被拦而没测成，
+  保留为"未测速"（`unmeasured: true`，诊断里写明原因），排在已测速线路之后；
+  只有 HTTP 错误码、返回 HTML、播放列表无效这类明确的内容问题才判为不可用。
+- **失败按域名计权**：起播 10 秒没数据、或播放列表（manifest）都加载不出来，说明域名连不上，计 2 次直接排除；
+  卡顿之类计 1 次，换线时让其他域名优先。播放列表加载另有更短的超时与重试，尽快交给换线。
 缓存过期返回 `409 PARSE_EXPIRED`，客户端重新调用 `/api/parse`。
 原来提交任意 `candidates` 地址的 POST 和 `sources` GET 不再支持。
 
@@ -262,13 +343,21 @@ public/app.js + Artplayer + hls.js + artplayer-plugin-danmuku
 | `ENABLE_BROWSER_PROVIDER` | `true` | 是否启用无头浏览器提取器；冰豆回退渠道也依赖此开关 |
 | `HTTP_PROVIDER_IDS` | 全部 | 逗号分隔的渠道 ID；未设置时启用全部，空字符串表示全部关闭 |
 | `HTTP_PROVIDER_TIMEOUT_MS` | `12000` | 每个 HTTP 渠道从入口到媒体地址的总超时（毫秒） |
-| `CHROME_BIN` | `/usr/bin/google-chrome` | 无头浏览器可执行文件路径 |
+| `PARSE_GRACE_MS` | `3000` | 解析提前响应的宽限：拿到第一条可用的已验证线路后再等这么久，让同样快的线路一起择优，其余渠道转后台继续并补进换线候选；`0` 表示立即响应 |
+| `CHANNEL_CONFIG_URL` | 空 | 渠道外部配置接口（必须 https，返回 JSON，格式见下）；为空则只用内置渠道 |
+| `CHANNEL_CONFIG_REFRESH_MS` | `600000` | 外部配置的刷新间隔；拉取失败后 1 分钟重试，期间沿用上一次成功的配置 |
+| `CHANNEL_STATE_FILE` | `data/channel-state.json` | 渠道健康账本的落盘位置；Vercel 等只读环境默认只用内存；设为空字符串可关闭落盘 |
+| `CHANNEL_DEAD_DAYS` | `3` | 累计多少个自然日不可用后摘除渠道 |
+| `CHANNEL_MIN_DAILY_ATTEMPTS` | `3` | 一个自然日至少尝试多少次才下结论，流量太小的日子不计入 |
+| `CHANNEL_TIMEZONE` | 服务器本地时区 | 划分"自然日"的时区，例如 `Asia/Shanghai` |
+| `CHROME_BIN` | Linux：`/usr/bin/google-chrome`；Windows：自动探测 `Program Files`、`Program Files (x86)`、`%LOCALAPPDATA%` 下的 Chrome，找不到时用 Edge | 无头浏览器可执行文件路径 |
+| `CHROME_PROXY` | 空 | 无头浏览器使用的代理，如 `http://127.0.0.1:7890` 或 `socks5://host:1080`；未设置时，Windows/macOS 沿用 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`（这两个平台的 Chrome 不读环境变量），Linux 的 Chrome 自己会读 |
 | `BENCHMARK_TIMEOUT_MS` | `3000` | 候选流分片测速超时时间（毫秒） |
 | `REQUEST_TIMEOUT_MS` | `15000` | 上游请求超时 |
 | `METADATA_TIMEOUT_MS` | `5000` | 元数据请求超时 |
 | `DANMAKU_TIMEOUT_MS` | `10000` | 弹幕请求超时 |
 | `STREAM_TIMEOUT_MS` | `10000` | 播放地址校验超时 |
-| `MEDIA_DNS_MODE` | `auto` | 服务端媒体 DNS：`auto` 系统解析并在 Fake-IP/私网答案时回退公网 DoH；`public` 强制 DoH；`system` 禁用回退 |
+| `MEDIA_DNS_MODE` | `auto` | 服务端媒体 DNS：`auto` 系统解析并在 Fake-IP/私网答案时回退公网 DoH；`public` 强制 DoH；`system` 禁用回退；`auto` 在系统 DNS 直接报错时同样回退。公共 DNS 并行查询阿里、DNSPod、Cloudflare、Google 四个固定 DoH 端点，谁先返回有效答案用谁 |
 | `CACHE_TTL_MS` | `300000` | 解析/弹幕缓存时间 |
 | `CACHE_MAX_ENTRIES` | `200` | 缓存条目上限 |
 
@@ -294,8 +383,10 @@ TTL/大小约束、私网拒绝、连接固定、重定向、压缩、连接取�
 真实上游联调（iQiyi + Bilibili + dmku）：
 
 ```bash
-RUN_LIVE_TESTS=1 npm test
+npm run test:live
 ```
+
+该命令会自行设置 `RUN_LIVE_TESTS=1`，Windows 的 cmd、PowerShell 与 Linux/macOS 通用。
 
 联调会验证：
 
@@ -331,6 +422,8 @@ videoshow/
 ├── public/
 │   ├── index.html         Artplayer 播放页
 │   ├── app.js             表单、解析请求、Artplayer/弹幕
+│   ├── ad-filter.js       播放列表拼接广告过滤（纯函数）
+│   ├── stall-monitor.js   卡顿判定状态机（纯函数）
 │   ├── styles.css         深色单页样式
 │   └── vendor/            hls.js、Artplayer、弹幕插件及许可证
 ├── test/

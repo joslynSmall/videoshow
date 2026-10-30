@@ -3,8 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { AppError } from "../errors.js";
 import { log } from "../log.js";
-
-const CHROME_PATH = process.env.CHROME_BIN || "/usr/bin/google-chrome";
+import { chromeBin, chromeDataDir, chromeProxyArgs, killChrome, removeChromeDir } from "./chrome.js";
 
 export function inferPlaybackType(playUrl) {
   return /\.mp4(\?|$)/i.test(playUrl) ? "mp4" : "m3u8";
@@ -23,7 +22,7 @@ export function isRetryableBrowserError(err) {
 }
 
 export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
-  if (!fs.existsSync(CHROME_PATH)) {
+  if (!fs.existsSync(chromeBin())) {
     throw new AppError("BROWSER_UNAVAILABLE", 503, "无头 Chrome 未安装");
   }
   let lastError = null;
@@ -46,10 +45,10 @@ export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
 }
 
 async function resolveOnce(sourceUrl, timeoutMs) {
-  const dataDir = path.join("/tmp", "vs-chrome-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  const dataDir = chromeDataDir("vs-chrome");
   fs.mkdirSync(dataDir, { recursive: true });
 
-  const chrome = spawn(CHROME_PATH, [
+  const chrome = spawn(chromeBin(), [
     "--headless=new",
     "--no-sandbox",
     "--disable-gpu",
@@ -59,32 +58,16 @@ async function resolveOnce(sourceUrl, timeoutMs) {
     "--mute-audio",
     "--user-data-dir=" + dataDir,
     "--remote-debugging-port=0",
+    ...chromeProxyArgs(),
   ], { stdio: "ignore" });
 
   let cleaned = false;
-  // Chrome 收到 SIGTERM 后需要一点时间关闭 profile，目录删太快会因 SingletonLock
-  // 等文件仍被占用而失败，残留 /tmp/vs-chrome-* 目录。
-  // 用异步退避重试，避免 Atomics.wait 阻塞事件循环影响其它并发请求。
-  const removeDirSoon = async () => {
-    for (let i = 0; i < 15; i += 1) {
-      try {
-        fs.rmSync(dataDir, { recursive: true, force: true });
-        return true;
-      } catch {
-        if (i === 4) { try { chrome.kill("SIGKILL"); } catch {} }
-        await new Promise((r) => setTimeout(r, 100));
-      }
-    }
-    try { chrome.kill("SIGKILL"); } catch {}
-    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch {}
-    return false;
-  };
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
-    try { chrome.kill("SIGTERM"); } catch {}
-    // 不等待目录删除：解析结果已经拿到，残留目录由 removeDirSoon 异步清理。
-    void removeDirSoon();
+    killChrome(chrome, "SIGTERM");
+    // 不等待目录删除：解析结果已经拿到，残留目录由 removeChromeDir 异步清理。
+    void removeChromeDir(dataDir, chrome);
   };
 
   const activePortFile = path.join(dataDir, "DevToolsActivePort");

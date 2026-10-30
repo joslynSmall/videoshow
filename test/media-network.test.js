@@ -4,7 +4,7 @@ import { gzipSync } from "node:zlib";
 import test from "node:test";
 import { config } from "../src/config.js";
 import { assertPublicMediaUrl, fetchPublicMedia, resolveMediaAddresses } from "../src/media.js";
-import { createPublicDnsResolver, requestPinnedMedia } from "../src/media-network.js";
+import { createPublicDnsResolver, DNS_ENDPOINTS, requestPinnedMedia } from "../src/media-network.js";
 
 const dnsAnswer = (address = "8.8.8.8", ttl = 5) => ({
   Status: 0, Answer: [{ type: 1, data: address, TTL: ttl }],
@@ -14,6 +14,7 @@ test("public DNS uses a fixed endpoint, bounds the request, and honors cache TTL
   let clock = 1000;
   let calls = 0;
   const resolver = createPublicDnsResolver({
+    endpoints: ["https://dns.google/resolve"],
     now: () => clock,
     fetchFn: async (raw, options) => {
       calls += 1;
@@ -42,7 +43,10 @@ test("public DNS rejects malformed, empty, failed, and oversized replies", async
     () => new Response("x".repeat(16 * 1024 + 1)),
     () => new Response("error", { status: 503 }),
   ]) {
-    const resolver = createPublicDnsResolver({ fetchFn: async () => response() });
+    const resolver = createPublicDnsResolver({
+      endpoints: ["https://dns.google/resolve"],
+      fetchFn: async () => response(),
+    });
     await assert.rejects(resolver("media.example"));
   }
 });
@@ -95,7 +99,7 @@ test("public mode still rejects private, fake, and mixed DNS answers before open
     });
     await assert.rejects(fetchPublicMedia(`https://${address.replaceAll(".", "-")}.example/a.m3u8`),
       { code: "BAD_REQUEST" });
-    assert.equal(queries, 1);
+    assert.equal(queries, DNS_ENDPOINTS.length, "每个固定端点各查询一次，之后不再发起任何媒体请求");
     mock.mock.restore();
   }
   await assert.rejects(assertPublicMediaUrl("https://media.example/a.m3u8", async () => [
@@ -200,4 +204,143 @@ test("aborting a pinned request after headers rejects an unfinished body", async
   const body = response.text();
   controller.abort();
   await assert.rejects(body);
+});
+
+test("auto mode falls back to public DNS when the system resolver fails outright", async (t) => {
+  const previous = config.mediaDnsMode;
+  config.mediaDnsMode = "auto";
+  t.after(() => { config.mediaDnsMode = previous; });
+  const failure = Object.assign(new Error("getaddrinfo ENOTFOUND media.example"), { code: "ENOTFOUND" });
+  const systemResolver = async () => { throw failure; };
+
+  const addresses = await resolveMediaAddresses("media.example", {
+    systemResolver,
+    publicResolver: async () => [{ address: "8.8.4.4", family: 4 }],
+  });
+  assert.deepEqual(addresses, [{ address: "8.8.4.4", family: 4 }]);
+
+  await assert.rejects(
+    resolveMediaAddresses("media.example", {
+      systemResolver,
+      publicResolver: async () => { throw new Error("doh offline"); },
+    }),
+    (err) => err === failure,
+    "两边都失败时保留系统解析的原始错误",
+  );
+});
+
+test("system mode never falls back and an aborted request does not retry", async (t) => {
+  const previous = config.mediaDnsMode;
+  t.after(() => { config.mediaDnsMode = previous; });
+  const failure = new Error("ENOTFOUND");
+  let publicCalls = 0;
+  const publicResolver = async () => { publicCalls += 1; return [{ address: "8.8.4.4", family: 4 }]; };
+
+  config.mediaDnsMode = "system";
+  await assert.rejects(
+    resolveMediaAddresses("media.example", { systemResolver: async () => { throw failure; }, publicResolver }),
+    (err) => err === failure,
+  );
+  config.mediaDnsMode = "auto";
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    resolveMediaAddresses("media.example", {
+      signal: controller.signal,
+      systemResolver: async () => { throw failure; },
+      publicResolver,
+    }),
+    (err) => err === failure,
+  );
+  assert.equal(publicCalls, 0);
+});
+
+test("public DNS queries every fixed endpoint in parallel and uses the first valid answer", async () => {
+  const asked = [];
+  const resolver = createPublicDnsResolver({
+    fetchFn: async (raw) => {
+      const url = new URL(raw);
+      asked.push(url.origin + url.pathname);
+      // 国内网络下 dns.google 经常不可达：它失败不能拖累其他端点。
+      if (url.hostname === "dns.google") throw new TypeError("fetch failed");
+      if (url.hostname === "cloudflare-dns.com") await new Promise((resolve) => setTimeout(resolve, 50));
+      return Response.json(dnsAnswer("1.2.3.4"));
+    },
+  });
+  assert.deepEqual(await resolver("media.example"), [{ address: "1.2.3.4", family: 4 }]);
+  assert.deepEqual([...asked].sort(), [...DNS_ENDPOINTS].sort());
+  assert.ok(DNS_ENDPOINTS.every((item) => item.startsWith("https://")));
+});
+
+test("public DNS reports NXDOMAIN separately from unreachable resolvers", async () => {
+  const dead = createPublicDnsResolver({ fetchFn: async () => Response.json({ Status: 3 }) });
+  await assert.rejects(dead("gone.example"), /没有有效的公网 IPv4 解析/);
+  const offline = createPublicDnsResolver({ fetchFn: async () => { throw new TypeError("fetch failed"); } });
+  await assert.rejects(offline("gone.example"), /公网 DNS 查询失败/);
+});
+
+test("probe distinguishes alive, dead and unknown hosts and caches the verdict", async () => {
+  let clock = 1000;
+  let calls = 0;
+  const resolver = createPublicDnsResolver({
+    now: () => clock,
+    fetchFn: async (raw) => {
+      calls += 1;
+      const url = new URL(raw);
+      const name = url.searchParams.get("name");
+      if (name === "alive.example") return Response.json(dnsAnswer("8.8.8.8"));
+      if (name === "gone.example") return Response.json({ Status: 3 });
+      if (name === "mixed.example") {
+        // 一个端点说 NXDOMAIN，其余不可达：仍然判定为已失效。
+        if (url.hostname === "dns.alidns.com") return Response.json({ Status: 3 });
+        throw new TypeError("fetch failed");
+      }
+      throw new TypeError("fetch failed");
+    },
+  });
+  assert.equal(await resolver.probe("alive.example"), "alive");
+  assert.equal(await resolver.probe("gone.example"), "dead");
+  assert.equal(await resolver.probe("mixed.example"), "dead");
+  assert.equal(await resolver.probe("silent.example"), "unknown", "所有端点都不可达时不能下结论");
+  assert.equal(await resolver.probe("203.0.113.9"), "alive", "IP 字面量不查询");
+
+  const before = calls;
+  await resolver.probe("gone.example");
+  assert.equal(calls, before, "判定结果缓存 60 秒");
+  clock += 61_000;
+  await resolver.probe("gone.example");
+  assert.ok(calls > before);
+});
+
+test("probe returns dead as soon as two resolvers agree without waiting for slow ones", async () => {
+  const resolver = createPublicDnsResolver({
+    queryTimeoutMs: 5000,
+    fetchFn: async (raw) => {
+      const url = new URL(raw);
+      if (url.hostname === "dns.alidns.com" || url.hostname === "doh.pub") return Response.json({ Status: 3 });
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return Response.json({ Status: 3 });
+    },
+  });
+  const startedAt = Date.now();
+  assert.equal(await resolver.probe("gone.example"), "dead");
+  assert.ok(Date.now() - startedAt < 1000, "不应等待慢端点");
+});
+
+test("concurrent probes of the same host share one lookup and one verdict", async () => {
+  let calls = 0;
+  const resolver = createPublicDnsResolver({
+    fetchFn: async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return Response.json({ Status: 3 });
+    },
+  });
+  const verdicts = await Promise.all([
+    resolver.probe("gone.example"),
+    resolver.probe("gone.example", { signal: AbortSignal.timeout(1) }),
+    resolver.probe("gone.example"),
+  ]);
+  assert.deepEqual(verdicts, ["dead", "dead", "dead"]);
+  assert.equal(calls, DNS_ENDPOINTS.length, "只查询一轮");
 });

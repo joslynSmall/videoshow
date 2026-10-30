@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AppError } from "../src/errors.js";
 import {
   benchmarkStream,
   extractFirstSegmentUrl,
   raceAndSelect,
   resolveSegmentUrl,
+  scoreStream,
 } from "../src/benchmark.js";
 
 test("resolveSegmentUrl handles absolute and relative URLs", () => {
@@ -190,4 +192,70 @@ test("benchmarkStream cancels failed playlist and media responses", async (t) =>
     assert.equal(canceled, true);
     mock.mock.restore();
   }
+});
+
+test("scoreStream puts sustained throughput ahead of a low first-byte time", () => {
+  assert.ok(
+    scoreStream(2000, 1000) > scoreStream(300, 100),
+    "2000KB/s 但首字节 1s 的线路，应当优于只有 300KB/s 的低延迟线路",
+  );
+  assert.ok(scoreStream(800, 100) > scoreStream(800, 1500), "吞吐相同时首字节更低的更优");
+  assert.equal(scoreStream(0, 100), 0);
+});
+
+test("benchmarkStream keeps a validated line when the measurement itself could not finish", async (t) => {
+  for (const failure of [
+    Object.assign(new Error("This operation was aborted"), { name: "AbortError" }),
+    Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" }),
+    Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } }),
+    new AppError("BAD_REQUEST", 400, "媒体地址不可访问"),
+  ]) {
+    const mock = t.mock.method(globalThis, "fetch", async () => { throw failure; });
+    const result = await benchmarkStream("https://8.8.8.8/video.mp4", "mp4");
+    assert.equal(result.available, true, failure.message);
+    assert.equal(result.unmeasured, true);
+    assert.equal(result.score, 0);
+    assert.equal(result.error, failure.message);
+    mock.mock.restore();
+  }
+});
+
+test("benchmarkStream still rejects clear content problems", async (t) => {
+  for (const response of [
+    () => new Response("denied", { status: 403 }),
+    () => new Response("<html></html>", { status: 200, headers: { "content-type": "text/html" } }),
+  ]) {
+    const mock = t.mock.method(globalThis, "fetch", async () => response());
+    const result = await benchmarkStream("https://8.8.8.8/video.mp4", "mp4");
+    assert.equal(result.available, false);
+    assert.equal(result.unmeasured, undefined);
+    mock.mock.restore();
+  }
+  t.mock.method(globalThis, "fetch", async () => new Response("not a playlist", { status: 200 }));
+  const playlist = await benchmarkStream("https://8.8.8.8/index.m3u8", "m3u8");
+  assert.equal(playlist.available, false, "内容不是合法播放列表属于确定的失败");
+});
+
+test("raceAndSelect ranks a measured line above an unmeasured one and passes the reason through", async () => {
+  const result = await raceAndSelect(
+    [{ provider: "slow", playUrl: "https://a.example/a.m3u8", type: "m3u8" },
+      { provider: "fast", playUrl: "https://b.example/b.m3u8", type: "m3u8" }],
+    {
+      benchmark: async (candidate) => candidate.provider === "slow"
+        ? { available: true, unmeasured: true, error: "timeout", ttfbMs: null, speedKBps: 0, score: 0 }
+        : { available: true, status: 206, ttfbMs: 80, speedKBps: 900, score: 833 },
+    },
+  );
+  assert.equal(result.winner.provider, "fast");
+  assert.deepEqual(result.ranked.map((item) => item.provider), ["fast", "slow"]);
+  assert.equal(result.ranked[1].unmeasured, true);
+  assert.equal(result.ranked[1].error, "timeout");
+  assert.equal(result.ranked[0].unmeasured, undefined);
+
+  const onlyUnmeasured = await raceAndSelect(
+    [{ provider: "slow", playUrl: "https://a.example/a.m3u8", type: "m3u8" },
+      { provider: "other", playUrl: "https://b.example/b.m3u8", type: "m3u8" }],
+    { benchmark: async () => ({ available: true, unmeasured: true, error: "timeout", ttfbMs: null, speedKBps: 0, score: 0 }) },
+  );
+  assert.ok(onlyUnmeasured.winner, "全部没测成时仍然要选出一条可用线路");
 });

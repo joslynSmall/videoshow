@@ -3,7 +3,7 @@ import test from "node:test";
 import { mapBilibiliSearch } from "../src/sites/impl/bilibili.js";
 import { iqiyiTvId, mapIqiyiAvlist, mapIqiyiSearch } from "../src/sites/impl/iqiyi.js";
 import { mapMgtvPage, mapMgtvSearch } from "../src/sites/impl/mgtv.js";
-import { mapQqEpisodeIds, mapQqSearch, qqCoverId } from "../src/sites/impl/qq.js";
+import { loadQqEpisodes, mapQqEpisodes, mapQqSearch, qqCoverId } from "../src/sites/impl/qq.js";
 import { mapYoukuEpisodes, youkuShowId } from "../src/sites/impl/youku.js";
 import { mapMgtvEpisodes, mgtvVideoId } from "../src/sites/impl/mgtv.js";
 import { mapBilibiliSeason } from "../src/sites/impl/bilibili.js";
@@ -25,6 +25,8 @@ test("mapIqiyiSearch keeps album pages and drops short clips", () => {
             videos: [
               { number: "1", subtitle: "上", pageUrl: "https://www.iqiyi.com/v_19rrll0l7g.html" },
               { number: "2", subtitle: "下", pageUrl: "https://www.iqiyi.com/v_second.html" },
+              { number: "花絮1", subtitle: "花絮1", pageUrl: "https://www.iqiyi.com/v_extra1.html" },
+              { number: "专访", subtitle: "专访", pageUrl: "https://www.iqiyi.com/v_extra2.html" },
             ],
           },
         },
@@ -108,12 +110,61 @@ test("mapQqSearch keeps native cover pages", () => {
   assert.equal(items[0].pageUrl, "https://v.qq.com/x/cover/mzc00200whsp9r6/a0047l69jnp.html");
 });
 
-test("mapQqEpisodeIds builds one page per tencent video id", () => {
+test("mapQqEpisodes keeps only numbered episodes and drops trailers and extras", () => {
   assert.equal(qqCoverId("https://v.qq.com/x/cover/mzc00200whsp9r6/a0047l69jnp.html"), "mzc00200whsp9r6");
-  assert.deepEqual(mapQqEpisodeIds("mzc00200whsp9r6", ["a0047l69jnp", "g0047vju30g"]), [
+  const rows = [
+    { vid: "t0", title: "《庆余年第三季》首发概念海报", is_trailer: "0" },
+    { vid: "a0047l69jnp", title: "1" },
+    { vid: "g0047vju30g", title: "2" },
+    { vid: "g0047vju30g", title: "2" },
+    { vid: "x1", title: "彩蛋1" },
+    { vid: "x2", title: "番外" },
+    { title: "第二季" },
+  ];
+  assert.deepEqual(mapQqEpisodes("mzc00200whsp9r6", rows), [
     { name: "第1集", pageUrl: "https://v.qq.com/x/cover/mzc00200whsp9r6/a0047l69jnp.html" },
     { name: "第2集", pageUrl: "https://v.qq.com/x/cover/mzc00200whsp9r6/g0047vju30g.html" },
   ]);
+  assert.deepEqual(mapQqEpisodes("mzc00200whsp9r6", [{ vid: "t0", title: "首发概念海报" }]), []);
+});
+
+test("loadQqEpisodes merges every tab of the episode list", async () => {
+  const page = (rows, tabs = []) => ({
+    data: {
+      module_list_datas: [
+        {
+          module_datas: [
+            {
+              module_params: { desk_module_type: "episode_list", tabs: JSON.stringify(tabs) },
+              item_data_lists: { item_datas: rows.map((item_params) => ({ item_params })) },
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const bodies = [];
+  const episodes = await loadQqEpisodes("https://v.qq.com/x/cover/cid1/v1.html", {
+    fetchJsonFn: async (_url, init) => {
+      const params = JSON.parse(init.body).page_params;
+      bodies.push(params.page_context);
+      if (params.page_context === "tab2") {
+        return page([{ vid: "v31", title: "31" }, { vid: "e1", title: "彩蛋1" }]);
+      }
+      return page(
+        [{ vid: "v1", title: "1" }, { vid: "v30", title: "30" }],
+        [
+          { selected: true, page_context: "tab1" },
+          { selected: false, page_context: "tab2" },
+        ],
+      );
+    },
+  });
+  assert.deepEqual(
+    episodes.map((item) => item.name),
+    ["第1集", "第30集", "第31集"],
+  );
+  assert.equal(bodies.length, 2);
 });
 
 test("mapYoukuEpisodes and show id come from the show page payload", () => {
@@ -126,30 +177,43 @@ test("mapYoukuEpisodes and show id come from the show page payload", () => {
   );
 });
 
-test("mapMgtvEpisodes reads the season pages", () => {
+test("mapMgtvEpisodes keeps only full episodes and drops previews and extras", () => {
   assert.equal(mgtvVideoId("https://www.mgtv.com/b/510924/18126859.html"), "18126859");
   assert.deepEqual(
     mapMgtvEpisodes({
       data: {
         list: [
-          { t1: "1", t4: "第1集", url: "/b/510924/18030368.html" },
-          { t1: "彩蛋1", t4: "第1集", url: "/b/824230/24416235.html" },
+          { t1: "1", t4: "第1集", isIntact: "1", url: "/b/510924/18030368.html" },
+          { t1: "2", t4: "第2集", isIntact: "3", url: "/b/510924/preview2.html" },
+          { t1: "2", t4: "第2集", isIntact: "1", url: "/b/510924/18030369.html" },
+          { t1: "番外", t4: "第1集", isIntact: "5", url: "/b/510924/extra.html" },
+          { t1: "彩蛋1", t4: "第1集", isIntact: "7", url: "/b/824230/24416235.html" },
+          { t1: "彩蛋2", t4: "第2集", url: "/b/824230/no-flag.html" },
         ],
       },
     }),
     [
       { name: "第1集", pageUrl: "https://www.mgtv.com/b/510924/18030368.html" },
-      { name: "彩蛋1", pageUrl: "https://www.mgtv.com/b/824230/24416235.html" },
+      { name: "第2集", pageUrl: "https://www.mgtv.com/b/510924/18030369.html" },
     ],
   );
 });
 
-test("mapBilibiliSeason reads episode pages", () => {
+test("mapBilibiliSeason reads episode pages and drops previews", () => {
   const episodes = mapBilibiliSeason({
-    result: { episodes: [{ title: "1", long_title: "新邻居", link: "https://www.bilibili.com/bangumi/play/ep810152" }] },
+    result: {
+      episodes: [
+        { title: "1", long_title: "新邻居", section_type: 0, link: "https://www.bilibili.com/bangumi/play/ep810152" },
+        { title: "2", badge: "预告", section_type: 1, link: "https://www.bilibili.com/bangumi/play/ep810153" },
+        { title: "3", badge: "预告", link: "https://www.bilibili.com/bangumi/play/ep810154" },
+        { title: "2", badge: "会员", section_type: 0, link: "https://www.bilibili.com/bangumi/play/ep810155" },
+      ],
+    },
   });
-  assert.equal(episodes[0].name, "第1集 新邻居");
-  assert.equal(episodes[0].pageUrl, "https://www.bilibili.com/bangumi/play/ep810152");
+  assert.deepEqual(episodes, [
+    { name: "第1集 新邻居", pageUrl: "https://www.bilibili.com/bangumi/play/ep810152" },
+    { name: "第2集", pageUrl: "https://www.bilibili.com/bangumi/play/ep810155" },
+  ]);
 });
 
 test("mapYoukuSearch reads show cards", () => {

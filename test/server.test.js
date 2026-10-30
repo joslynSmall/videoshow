@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AppError } from "../src/errors.js";
 import { HTTP_CHANNELS, resolveHttpChannel } from "../src/providers/http.js";
+import { createChannelHealth } from "../src/channels/health.js";
+import { createChannelRegistry } from "../src/channels/registry.js";
 import { createServer } from "../src/server.js";
 
 const SAMPLE = "https://www.bilibili.com/video/BV1JP41167xK";
@@ -42,6 +44,7 @@ async function start(t, overrides = {}) {
       count: 1,
       items: [{ time: 1, mode: 0, color: "#FFFFFF", text: "弹幕" }],
     }),
+    probeHost: async () => "unknown",
     logger: silentLogger,
     ...overrides,
   });
@@ -262,6 +265,7 @@ test("single-use candidates are returned by parse and /api/race without media re
     total: 1,
     excluded: 0,
     expired: 0,
+    hostBlocked: 0,
     remaining: 1,
   });
   assert.equal(raced, 0);
@@ -280,6 +284,7 @@ test("single-use candidates are returned by parse and /api/race without media re
     total: 1,
     excluded: 1,
     expired: 0,
+    hostBlocked: 0,
     remaining: 0,
   });
 });
@@ -628,6 +633,17 @@ test("player vendor assets are served", async (t) => {
   }
 });
 
+test("front-end script modules are served", async (t) => {
+  const { base } = await start(t);
+  for (const asset of ["/app.js", "/ad-filter.js", "/danmaku-text.js", "/stall-monitor.js"]) {
+    const response = await fetch(`${base}${asset}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(response.status, 200, asset);
+    assert.match(response.headers.get("content-type"), /javascript/);
+  }
+});
+
 test("unknown API and static paths return 404", async (t) => {
   const { base } = await start(t);
   const apiResponse = await fetch(`${base}/api/nope`, {
@@ -860,3 +876,337 @@ test("an upstream failure briefly cools down only that channel", async (t) => {
 });
 
 
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function postRace(base, body) {
+  const response = await fetch(`${base}/api/race`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+  return { response, body: await response.json() };
+}
+
+test("parse responds once a verified line is ready and backfills slow channels into the cache", async (t) => {
+  const PRIMARY = "https://media.example/primary.m3u8";
+  const { base } = await start(t, {
+    parseGraceMs: 20,
+    resolve: async () => fakeResult({ provider: "primary", playUrl: PRIMARY }),
+    resolveBrowser: async () => {
+      await sleep(2500);
+      return fakeResult({ provider: "jx-browser", playUrl: "https://media.example/browser.m3u8" });
+    },
+  });
+
+  const startedAt = Date.now();
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  const elapsed = Date.now() - startedAt;
+  assert.equal(parse.response.status, 200);
+  assert.equal(parse.body.data.provider, "primary");
+  // 慢渠道要 2500ms；留足余量给负载高的机器，只要明显早于它就说明没有等它。
+  assert.ok(elapsed < 1500, `响应不应等待慢渠道，实际耗时 ${elapsed}ms`);
+  assert.deepEqual(parse.body.data.candidates.map((item) => item.provider), ["primary"]);
+  const background = parse.body.data.diagnostics.find((item) => item.provider === "jx-browser");
+  assert.equal(background.status, "background");
+
+  // 慢渠道还没结束时，换线只能用已有的线路。
+  const early = await postRace(base, { sourceUrl: SAMPLE, failedPlayUrls: [PRIMARY] });
+  assert.equal(early.body.data.selected, null);
+
+  await sleep(2800);
+  const late = await postRace(base, { sourceUrl: SAMPLE, failedPlayUrls: [PRIMARY] });
+  assert.equal(late.body.data.selected?.provider, "jx-browser", "后台完成后应补进缓存，供换线使用");
+
+  const cached = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(cached.body.data.cached, true);
+  assert.deepEqual(cached.body.data.candidates.map((item) => item.provider), ["primary", "jx-browser"]);
+});
+
+test("the grace window lets an equally fast channel join the race", async (t) => {
+  const { base } = await start(t, {
+    parseGraceMs: 300,
+    resolve: async () => fakeResult({ provider: "primary", playUrl: "https://media.example/primary.m3u8" }),
+    resolveBrowser: async () => {
+      await sleep(60);
+      return fakeResult({ provider: "jx-browser", playUrl: "https://media.example/browser.m3u8" });
+    },
+  });
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.deepEqual(
+    parse.body.data.candidates.map((item) => item.provider).sort(),
+    ["jx-browser", "primary"],
+  );
+  assert.equal(parse.body.data.diagnostics.some((item) => item.status === "background"), false);
+});
+
+test("a late channel never leaks into a newer forced parse", async (t) => {
+  const PRIMARY = "https://media.example/primary.m3u8";
+  let calls = 0;
+  const { base } = await start(t, {
+    parseGraceMs: 10,
+    resolve: async () => fakeResult({ provider: "primary", playUrl: PRIMARY }),
+    resolveBrowser: async () => {
+      calls += 1;
+      const call = calls;
+      await sleep(call === 1 ? 150 : 350);
+      return fakeResult({ provider: "jx-browser", playUrl: `https://media.example/late-${call}.m3u8` });
+    },
+  });
+  await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}&force=1`);
+  await sleep(600);
+  const race = await postRace(base, { sourceUrl: SAMPLE, failedPlayUrls: [PRIMARY] });
+  assert.equal(race.body.data.selected?.playUrl, "https://media.example/late-2.m3u8");
+  assert.equal(race.body.data.candidates.length, 1, "旧解析的迟到结果必须丢弃");
+});
+
+test("without any verified line parse still waits for every primary channel", async (t) => {
+  const { base } = await start(t, {
+    parseGraceMs: 10,
+    resolve: async () => fakeResult({ provider: "single", playUrl: "https://media.example/single.m3u8", singleUse: true }),
+    resolveBrowser: async () => {
+      await sleep(120);
+      return fakeResult({ provider: "jx-browser", playUrl: "https://media.example/browser.m3u8" });
+    },
+  });
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(parse.body.data.provider, "jx-browser", "只有单次链接时不能提前响应，要等已验证线路");
+  assert.equal(parse.body.data.candidates.length, 2);
+});
+
+// 多个解析渠道共用同一个 CDN 域名时，一个域名失败就不该在同域名的候选上反复重试。
+async function startWithHosts(t) {
+  return start(t, {
+    parseGraceMs: 50,
+    resolve: async () => fakeResult({ provider: "primary", playUrl: "https://dead.example/a.m3u8" }),
+    resolveBrowser: async () => fakeResult({ provider: "jx-browser", playUrl: "https://alive.example/b.m3u8" }),
+    httpChannels: [{ id: "lx", singleUse: true }, { id: "qilin", singleUse: true }],
+    resolveHttp: async (channel) => fakeResult({
+      provider: channel.id,
+      singleUse: true,
+      playUrl: channel.id === "lx" ? "https://dead.example/lx.m3u8" : "https://dead.example/qilin.m3u8",
+    }),
+  });
+}
+
+test("/api/race prefers candidates from hosts that have not failed, then falls back", async (t) => {
+  const { base } = await startWithHosts(t);
+  await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  const failedUrl = "https://dead.example/a.m3u8";
+
+  // dead.example 失败过一次：同域名的单次链接排在其他域名的已验证线路之后。
+  const avoid = await postRace(base, { sourceUrl: SAMPLE, failedPlayUrls: [failedUrl], avoidHosts: ["dead.example"] });
+  assert.equal(avoid.body.data.selected.provider, "jx-browser");
+
+  // 其他域名也失败后，仍可退回同域名重试一次，而不是直接判定没有线路。
+  const fallback = await postRace(base, {
+    sourceUrl: SAMPLE,
+    failedPlayUrls: [failedUrl, "https://alive.example/b.m3u8"],
+    avoidHosts: ["dead.example", "alive.example"],
+  });
+  assert.equal(fallback.body.data.selected.singleUse, true);
+  assert.match(fallback.body.data.selected.playUrl, /dead.example/);
+
+  // 不带域名信息时保持原有行为：已验证线路优先于单次链接。
+  const plain = await postRace(base, { sourceUrl: SAMPLE, failedPlayUrls: [failedUrl] });
+  assert.equal(plain.body.data.selected.provider, "jx-browser");
+});
+
+test("/api/race drops every candidate on a host that failed twice", async (t) => {
+  const { base } = await startWithHosts(t);
+  await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  const blocked = await postRace(base, {
+    sourceUrl: SAMPLE,
+    failedPlayUrls: ["https://alive.example/b.m3u8"],
+    avoidHosts: ["dead.example", "alive.example"],
+    blockedHosts: ["dead.example", "alive.example"],
+  });
+  assert.equal(blocked.body.data.selected, null);
+  assert.equal(blocked.body.data.filtered.hostBlocked, 4);
+  assert.equal(blocked.body.data.filtered.remaining, 0);
+});
+
+test("/api/race rejects malformed host lists", async (t) => {
+  const { base } = await startWithHosts(t);
+  await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  for (const body of [
+    { sourceUrl: SAMPLE, avoidHosts: [1] },
+    { sourceUrl: SAMPLE, blockedHosts: new Array(21).fill("a.example") },
+    { sourceUrl: SAMPLE, avoidHosts: ["x".repeat(300)] },
+  ]) {
+    const result = await postRace(base, body);
+    assert.equal(result.response.status, 400);
+  }
+});
+
+test("single-use links on a dead domain are dropped before they can be selected", async (t) => {
+  const probed = [];
+  const { base } = await start(t, {
+    parseGraceMs: 50,
+    probeHost: async (host) => {
+      probed.push(host);
+      return host === "dead.example" ? "dead" : "alive";
+    },
+    resolve: async () => fakeResult({ provider: "primary", playUrl: "https://alive.example/a.m3u8" }),
+    httpChannels: [{ id: "lx", singleUse: true }, { id: "qilin", singleUse: true }],
+    resolveHttp: async (channel) => fakeResult({
+      provider: channel.id,
+      singleUse: true,
+      playUrl: channel.id === "lx" ? "https://dead.example/lx.m3u8" : "https://fresh.example/qilin.m3u8",
+    }),
+  });
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.deepEqual(
+    parse.body.data.candidates.map((item) => item.provider).sort(),
+    ["primary", "qilin"],
+    "已失效域名上的单次链接不应出现在候选里",
+  );
+  const lx = parse.body.data.diagnostics.find((item) => item.provider === "lx");
+  assert.equal(lx.status, "rejected");
+  assert.equal(lx.code, "HOST_UNREACHABLE");
+  assert.deepEqual([...new Set(probed)].sort(), ["dead.example", "fresh.example"], "只探测单次链接，已验证线路不需要");
+
+  // 缓存里也没有它，换线不会再选到。
+  const race = await postRace(base, { sourceUrl: SAMPLE, failedPlayUrls: ["https://alive.example/a.m3u8"] });
+  assert.equal(race.body.data.selected.provider, "qilin");
+  assert.equal(race.body.data.candidates.length, 1);
+});
+
+test("an unknown domain verdict never drops a single-use link", async (t) => {
+  const { base } = await start(t, {
+    probeHost: async () => { throw new Error("doh offline"); },
+    resolve: async () => fakeResult({ provider: "single", singleUse: true, playUrl: "https://media.example/s.m3u8" }),
+    resolveBrowser: null,
+  });
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(parse.body.data.provider, "single");
+});
+
+test("benchmark diagnostics carry the reason instead of a bare failure", async (t) => {
+  const failed = await start(t, {
+    race: async (candidates) => ({
+      winner: null,
+      ranked: candidates.map((item) => ({ provider: item.provider, available: false, status: 403, selected: false })),
+    }),
+  });
+  const rejected = await getJson(`${failed.base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(rejected.response.status, 502);
+
+  // 测速没跑完但内容校验通过：保留为未测速的可用线路，并说明原因。
+  const unmeasured = await start(t, {
+    race: async (candidates) => ({
+      winner: candidates[0],
+      ranked: candidates.map((item) => ({
+        provider: item.provider,
+        playUrl: item.playUrl,
+        type: item.type,
+        available: true,
+        unmeasured: true,
+        error: "This operation was aborted",
+        speedKBps: 0,
+        ttfbMs: null,
+        score: 0,
+        selected: true,
+      })),
+    }),
+  });
+  const parse = await getJson(`${unmeasured.base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(parse.response.status, 200);
+  assert.equal(parse.body.data.verified, true);
+  const diag = parse.body.data.diagnostics[0];
+  assert.equal(diag.status, "benchmarked");
+  assert.equal(diag.unmeasured, true);
+  assert.match(diag.message, /测速未完成.*aborted/);
+});
+
+// 渠道健康：连续几个自然日都没有可用结果的渠道会被摘除，之后不再参与解析。
+test("parse records outcomes by natural day and drops a channel after three dead days", async (t) => {
+  const clock = { now: Date.UTC(2026, 9, 1, 12) };
+  const health = createChannelHealth({ now: () => clock.now, timeZone: "UTC" });
+  const registry = createChannelRegistry({
+    builtins: [{ id: "lx", name: "LX解析", endpoint: "https://jx.example.com/?url=", singleUse: true }],
+    health,
+    now: () => clock.now,
+  });
+  const calls = [];
+  const { base } = await start(t, {
+    channelRegistry: registry,
+    now: () => clock.now,
+    parseGraceMs: 0,
+    resolve: async () => fakeResult({ provider: "primary", playUrl: "https://media.example/primary.m3u8" }),
+    resolveHttp: async (channel) => {
+      calls.push(channel.id);
+      return null;
+    },
+  });
+  const parse = (n) => getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}&force=${n}`);
+
+  for (const day of [1, 2, 3]) {
+    clock.now = Date.UTC(2026, 9, day, 12);
+    for (let i = 0; i < 3; i += 1) {
+      const result = await parse(1);
+      const lx = result.body.data.diagnostics.find((item) => item.provider === "lx");
+      assert.equal(lx.status, "empty", "无结果");
+    }
+  }
+  assert.equal(calls.length, 9);
+  assert.equal(health.isRemoved("lx"), false, "第 3 天还没结束");
+
+  clock.now = Date.UTC(2026, 9, 4, 8);
+  const afterDay = await parse(1);
+  assert.equal(afterDay.response.status, 200);
+  assert.equal(health.isRemoved("lx"), true, "跨天后第一次解析完成就结算");
+
+  const before = calls.length;
+  const next = await parse(1);
+  assert.equal(calls.length, before, "已摘除的渠道不再被调用");
+  assert.equal(next.body.data.diagnostics.some((item) => item.provider === "lx"), false);
+  assert.equal(next.body.data.provider, "primary");
+
+  const status = await getJson(`${base}/api/channels`);
+  const lx = status.body.data.channels.find((item) => item.id === "lx");
+  assert.equal(lx.state, "removed");
+  assert.equal(lx.reason, "累计 3 个自然日不可用");
+  const primary = status.body.data.channels.find((item) => item.id === "jiexi789");
+  assert.equal(primary.state, "active");
+  assert.equal(status.body.data.remote.configured, false);
+  assert.equal(JSON.stringify(status.body).includes("jx.example.com"), false, "不暴露渠道地址");
+});
+
+test("local environment failures and cooldown skips are not counted against a channel", async (t) => {
+  const health = createChannelHealth({ timeZone: "UTC" });
+  const registry = createChannelRegistry({
+    builtins: [{ id: "bingdou", name: "冰豆", endpoint: "https://bd.example.com/?url=", singleUse: true, fallback: true }],
+    health,
+  });
+  const { base } = await start(t, {
+    channelRegistry: registry,
+    parseGraceMs: 0,
+    resolve: async () => { throw new AppError("STREAM_INVALID", 502, "primary down"); },
+    resolveHttp: async () => { throw new AppError("BROWSER_UNAVAILABLE", 503, "冰豆渠道需要无头 Chrome"); },
+  });
+  await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.equal(health.status("bingdou").today.attempts, 0, "没装 Chrome 是本机问题，不算渠道失败");
+  assert.equal(health.status("jiexi789").today.attempts, 1);
+  assert.equal(health.status("jiexi789").today.successes, 0);
+});
+
+test("a channel disabled by the remote config is skipped", async (t) => {
+  const registry = createChannelRegistry({
+    builtins: [{ id: "lx", name: "LX解析", endpoint: "https://jx.example.com/?url=" }],
+    remoteUrl: "https://config.example.com/channels.json",
+    fetchFn: async () => Response.json({ channels: [{ id: "lx", enabled: false }, { id: "jx-browser", enabled: false }] }),
+  });
+  await registry.refresh();
+  const calls = [];
+  const { base } = await start(t, {
+    channelRegistry: registry,
+    resolveBrowser: async () => { calls.push("jx-browser"); return fakeResult({ provider: "jx-browser" }); },
+    resolveHttp: async (channel) => { calls.push(channel.id); return null; },
+  });
+  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(parse.body.data.diagnostics.map((item) => item.provider), ["jiexi789"]);
+});

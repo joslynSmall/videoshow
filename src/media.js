@@ -56,7 +56,19 @@ export async function resolveMediaAddresses(
   if (config.mediaDnsMode === "public") {
     return publicResolver(host, { signal });
   }
-  const addresses = await systemResolver(host);
+  let addresses;
+  try {
+    addresses = await systemResolver(host);
+  } catch (err) {
+    // 系统 DNS 直接报错（例如只能通过代理上网、本机没有可用的 DNS 服务器）时，
+    // auto 模式同样回退到公共 DNS；两边都失败则保留系统解析的原始错误。
+    if (config.mediaDnsMode !== "auto" || signal?.aborted) throw err;
+    try {
+      return await publicResolver(host, { signal });
+    } catch {
+      throw err;
+    }
+  }
   const fakeOrPrivate = Array.isArray(addresses) &&
     addresses.some((entry) => isBlocked(entry.address));
   if (config.mediaDnsMode !== "auto" || !fakeOrPrivate) return addresses;

@@ -1,4 +1,6 @@
+import { stripAdBlocks } from "/ad-filter.js";
 import { splitDanmakuText } from "/danmaku-text.js";
+import { createStallMonitor } from "/stall-monitor.js";
 
 window.renderArtDanmaku = function renderArtDanmaku(item) {
   const el = item?.$ref;
@@ -77,6 +79,12 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   let progressSaveTimer = 0;
   let stallTimer = 0;
   let switchingLine = false;
+  // 当前播放器的看门狗重启函数：换线成功后对新线路重新计时（起播阶段重新开始）。
+  let resumeWatchdog = null;
+  // 换线中新线路出现致命错误时，用它让本次尝试立即失败并进入下一个候选，否则会一直等下去。
+  let rejectSwitch = null;
+  // 新线路必须在这段时间内出数据（比起播判定的 10 秒略宽），否则视为本次换线失败。
+  const SWITCH_TIMEOUT_MS = 12000;
 
   const devlogEl = document.querySelector("#devlog");
   const devlogList = document.querySelector("#devlog-list");
@@ -574,6 +582,33 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     }
   }
 
+  // 出现误判时可在控制台执行 localStorage.setItem("videoshow.adFilter", "off") 关闭。
+  function adFilterEnabled() {
+    try {
+      return localStorage.getItem("videoshow.adFilter") !== "off";
+    } catch {
+      return true;
+    }
+  }
+
+  function filterPlaylistResponse(response, playlistUrl) {
+    if (typeof response?.data !== "string") return response;
+    try {
+      const { text, removed } = stripAdBlocks(response.data, playlistUrl);
+      if (!removed.length) return response;
+      devlog("广告片段已移除", {
+        blocks: removed.length,
+        seconds: removed.reduce((sum, item) => sum + item.seconds, 0).toFixed(1),
+        at: removed.map((item) => formatTime(item.at)).join(","),
+        host: removed.map((item) => item.family).join(","),
+        playHost: hostOf(playlistUrl),
+      }, "warn");
+      return { ...response, data: text };
+    } catch {
+      return response;
+    }
+  }
+
   function playM3u8(video, url, artInstance, onFatal, onAttached) {
     const tried = new Set();
     const retry = { maxNumRetry: 2, retryDelayMs: 300, maxRetryDelayMs: 1000 };
@@ -601,8 +636,16 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
               this.fallback = null;
             }
 
-            load(context, config, callbacks) {
+            load(context, config, rawCallbacks) {
               const original = context?.url;
+              // 播放列表在交给 hls.js 之前先去掉拼接广告；分片响应不是文本，原样放行。
+              const callbacks = adFilterEnabled()
+                ? {
+                    ...rawCallbacks,
+                    onSuccess: (response, ...rest) =>
+                      rawCallbacks.onSuccess?.(filterPlaylistResponse(response, original), ...rest),
+                  }
+                : rawCallbacks;
               let crossOrigin = false;
               try {
                 crossOrigin =
@@ -668,8 +711,19 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
             }
           }
         : undefined;
+      // 播放列表是起播的前提：域名不通时尽快报错，交给换线逻辑，而不是等 hls.js 默认的长超时与重试。
+      const playlistPolicy = {
+        default: {
+          maxTimeToFirstByteMs: 6000,
+          maxLoadTimeMs: 10000,
+          timeoutRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
+          errorRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 1000 },
+        },
+      };
       const hls = new window.Hls({
         enableWorker: false,
+        manifestLoadPolicy: playlistPolicy,
+        playlistLoadPolicy: playlistPolicy,
         ...(loader ? { loader } : {}),
         fragLoadPolicy: {
           default: {
@@ -701,8 +755,18 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         }, "error");
         hls.destroy();
         artInstance.hls = null;
+        // 播放列表（manifest/level）都取不到，说明这个域名连不上，换线时要整个域名排除。
+        const reason = /manifestLoad|levelLoad|playlistLoad/i.test(detail.details || "")
+          ? "unreachable"
+          : "fatal";
+        // 恢复直链是异步的：期间如果已经换到别的线路，这条线路迟到的错误必须丢弃，
+        // 否则会把新线路的换线尝试误判为失败。
+        const fail = () => {
+          if (artInstance.activeHlsUrl !== url) return;
+          onFatal?.(reason);
+        };
         if (tried.has(source)) {
-          onFatal?.();
+          fail();
           return;
         }
         tried.add(source);
@@ -712,9 +776,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
               useRecovered(recovered);
               return;
             }
-            onFatal?.();
+            fail();
           })
-          .catch(() => onFatal?.());
+          .catch(fail);
       });
     };
 
@@ -771,8 +835,15 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return title.replace(/(\s+第\d+集|\s+全集|\s+正片)+/gi, "").trim() || title;
   }
 
-  async function pickFasterSource(sourceUrl, failedPlayUrls, refreshed = false) {
-    devlog("重新测速", { excluded: failedPlayUrls.length, refreshed }, "info");
+  async function pickFasterSource(sourceUrl, failedPlayUrls, hosts = {}, refreshed = false) {
+    const avoidHosts = hosts.avoidHosts || [];
+    const blockedHosts = hosts.blockedHosts || [];
+    devlog("重新测速", {
+      excluded: failedPlayUrls.length,
+      avoidHosts: avoidHosts.join(",") || "-",
+      blockedHosts: blockedHosts.join(",") || "-",
+      refreshed,
+    }, "info");
     try {
       const response = await fetch("/api/race", {
         method: "POST",
@@ -780,7 +851,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           "content-type": "application/json",
           accept: "application/json",
         },
-        body: JSON.stringify({ sourceUrl, failedPlayUrls }),
+        body: JSON.stringify({ sourceUrl, failedPlayUrls, avoidHosts, blockedHosts }),
       });
       const payload = await response.json();
       const candidates = payload?.data?.candidates || [];
@@ -812,7 +883,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       if (response.status === 409 && !refreshed) {
         devlog("race 缓存过期", "强制重新解析后重试", "warn");
         await parse(sourceUrl, { force: true });
-        return pickFasterSource(sourceUrl, failedPlayUrls, true);
+        return pickFasterSource(sourceUrl, failedPlayUrls, hosts, true);
       }
       if (response.ok && selected?.playUrl && selected.available !== false) return selected;
       if (response.ok && !selected && !refreshed) {
@@ -823,7 +894,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           devlog("重新解析失败", err instanceof Error ? err.message : String(err), "error");
           return null;
         }
-        return pickFasterSource(sourceUrl, failedPlayUrls, true);
+        return pickFasterSource(sourceUrl, failedPlayUrls, hosts, true);
       }
       devlog("race 无可用候选", {
         status: response.status,
@@ -836,7 +907,12 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return null;
   }
 
-  async function switchToSmootherSource(data) {
+  // 起播失败和播放列表取不到说明域名连不上（计 2 次，直接排除）；卡顿之类只计 1 次。
+  function failureWeight(reason) {
+    return reason === "startup" || reason === "unreachable" ? 2 : 1;
+  }
+
+  async function switchToSmootherSource(data, reason = "") {
     if (switchingLine || !art) {
       devlog("换线跳过", switchingLine ? "已有换线进行中" : "播放器不存在", "warn");
       return;
@@ -844,11 +920,26 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     const instance = art;
     const continueAt = Number.isFinite(instance.currentTime) ? instance.currentTime : 0;
     const failed = new Set(Array.isArray(data.failedPlayUrls) ? data.failedPlayUrls : []);
-    if (data.playUrl) failed.add(data.playUrl);
+    // 按域名累计失败次数：失败 1 次后换线优先选其他域名，失败 2 次就不再尝试该域名，
+    // 避免在同一个已失效的域名（例如多个解析渠道共用同一个 CDN）上反复浪费时间。
+    const hostFails = new Map(Object.entries(data.failedHostCounts || {}));
+    const bumpHost = (url, weight = 1) => {
+      const host = hostOf(url);
+      if (host) hostFails.set(host, (hostFails.get(host) || 0) + weight);
+    };
+    const hostLists = () => ({
+      avoidHosts: [...hostFails].filter(([, count]) => count >= 1).map(([host]) => host),
+      blockedHosts: [...hostFails].filter(([, count]) => count >= 2).map(([host]) => host),
+    });
+    if (data.playUrl) {
+      failed.add(data.playUrl);
+      bumpHost(data.playUrl, failureWeight(reason));
+    }
     switchingLine = true;
     clearStallTimer();
     setStatus("播放不够流畅，正在更换线路…", "loading");
     devlog("触发换线", {
+      reason: reason || "-",
       from: data.provider || "-",
       fromHost: hostOf(data.playUrl),
       continueAt: Math.round(continueAt),
@@ -857,7 +948,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     try {
       for (let attempts = 0; attempts < 8; attempts += 1) {
         devlog("换线尝试", { attempt: attempts + 1, excluded: failed.size }, "info");
-        const chosen = await pickFasterSource(data.sourceUrl, [...failed]);
+        const chosen = await pickFasterSource(data.sourceUrl, [...failed], hostLists());
         if (art !== instance) {
           devlog("换线中止", "播放器已重建", "warn");
           return;
@@ -882,7 +973,25 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           instance.hls?.destroy();
           instance.hls = null;
           instance.type = chosen.type;
-          await instance.switchQuality(chosen.playUrl);
+          let timer = 0;
+          try {
+            await Promise.race([
+              instance.switchQuality(chosen.playUrl),
+              new Promise((_, reject) => { rejectSwitch = reject; }),
+              new Promise((_, reject) => {
+                timer = window.setTimeout(
+                  () => reject(Object.assign(
+                    new Error(`新线路 ${SWITCH_TIMEOUT_MS / 1000} 秒内没有加载出数据`),
+                    { weight: 2 },
+                  )),
+                  SWITCH_TIMEOUT_MS,
+                );
+              }),
+            ]);
+          } finally {
+            window.clearTimeout(timer);
+            rejectSwitch = null;
+          }
           if (art !== instance) return;
           reportPlayback("playback.switch", {
             fromHost: hostOf(data.playUrl),
@@ -904,9 +1013,15 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           }
           const activeVideo = player.querySelector("video");
           setStatus(activeVideo?.paused ? "线路已切换，请点击播放继续。" : "", "");
+          resumeWatchdog?.();
           return;
         } catch (err) {
-          devlog("换线失败", err instanceof Error ? err.message : String(err), "error");
+          bumpHost(chosen.playUrl, err?.weight || 1);
+          devlog("换线失败", {
+            host: hostOf(chosen.playUrl),
+            failures: hostFails.get(hostOf(chosen.playUrl)) || 0,
+            reason: err instanceof Error ? err.message : String(err),
+          }, "error");
           console.warn("线路切换失败", err);
         }
       }
@@ -918,6 +1033,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       devlog("换线结束", "没有可用备用线路", "error");
       setStatus("暂时播不了，请稍后再试。", "error");
     } finally {
+      data.failedHostCounts = Object.fromEntries(hostFails);
       switchingLine = false;
     }
   }
@@ -1025,15 +1141,19 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     const danmakuEndpoint = data.danmaku?.endpoint || "";
     let playbackFailed = false;
-    let hasPlayed = false;
-    let playRequested = false;
     let sourceAttached = data.type !== "m3u8";
-    const failPlayback = (force = false) => {
-      if (playbackFailed) return;
+    const failPlayback = (force = false, reason = "") => {
+      if (playbackFailed) {
+        // 已在换线：说明是新线路也出了致命错误，立即结束本次尝试，由换线循环换下一个候选。
+        if (switchingLine) {
+          rejectSwitch?.(Object.assign(new Error("新线路播放失败"), { weight: failureWeight(reason) }));
+        }
+        return;
+      }
       if (!sourceAttached && !force) return;
       playbackFailed = true;
       clearStallTimer();
-      switchToSmootherSource(data);
+      switchToSmootherSource(data, reason);
     };
 
     window.Artplayer.PLAYBACK_RATE = PLAYBACK_RATES;
@@ -1058,7 +1178,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       theme: "#c6f36b",
       customType: {
         m3u8: (video, url, artInstance) =>
-          playM3u8(video, url, artInstance, () => failPlayback(true), () => {
+          playM3u8(video, url, artInstance, (reason) => failPlayback(true, reason), () => {
             sourceAttached = true;
           }),
       },
@@ -1075,82 +1195,76 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       ],
     });
 
-    // 播放进度看门狗：每 1 秒轮询一次，判断"播放是否真的在推进"。
+    // 播放卡顿看门狗：每 tickMs 采样一次，判定全部交给 stall-monitor，这里只负责采样和执行动作。
     //
-    // 为什么用轮询而不用 waiting 事件：
-    //   1. HLS.js 卡在首帧时可能既不派发 playing 也不派发 waiting，事件驱动会完全漏判；
-    //   2. 真实卡顿时 waiting 会高频重复派发，任何"收到事件就重置计时/停表"的写法都会让阈值永远计不满；
-    //   3. 所以看门狗完全独立运行，不注册任何 waiting 监听，事件一律不干预它。
+    //   起播失败（10 秒没数据）、硬卡死（播放中断流 5 秒）、慢性卡顿（60 秒内卡 3 次或占比 ≥15%）才会换线；
+    //   断流 3 秒时先自救一次（降一档清晰度并让 HLS 重新拉分片），不直接换线；
+    //   暂停、拖动进度条、断网都不算线路卡顿；换线后 30 秒内不因慢性卡顿再换，避免来回切。
     //
-    // 换线门槛（全部满足才换）：
-    //   1. hasPlayed（video:playing 已触发，真的开始出画面了）或
-    //      playRequested（video:play 已触发，用户确实要求播放但源不给首帧）；
-    //      两者都不成立时说明用户尚未介入（未点播放且未自动播放），不当作卡顿；
-    //   2. !paused && !seeking && !ended；
-    //   3. readyState < HAVE_FUTURE_DATA(3)：缓冲确实不足；
-    //   4. 连续 STALL_SECONDS 秒 currentTime 前进不足 STALL_PROGRESS 秒。
-    const STALL_SECONDS = 8;
-    const STALL_PROGRESS = 1;
-    let stallAnchorTime = player.querySelector("video")?.currentTime ?? 0;
-    let stallAnchorAt = Date.now();
-    const markStallAnchor = () => {
-      const current = player.querySelector("video");
-      if (!current) return;
-      stallAnchorTime = current.currentTime;
-      stallAnchorAt = Date.now();
-    };
+    // 不监听 waiting 事件：真实卡顿时它会高频重复派发，事件驱动要么漏判要么反复重置计时。
+    const monitor = createStallMonitor();
+    const activeArt = art;
     const stopWatchdog = () => {
       if (stallTimer) {
         window.clearInterval(stallTimer);
         stallTimer = 0;
       }
     };
+    const recoverPlayback = (decision) => {
+      const hls = activeArt.hls;
+      devlog("卡顿自救", {
+        stalledSeconds: Math.round(decision.stalledMs / 100) / 10,
+        level: hls?.currentLevel ?? "-",
+        levels: hls?.levels?.length ?? 0,
+      }, "warn");
+      if (!hls) return;
+      try {
+        if (hls.levels?.length > 1 && hls.currentLevel > 0) hls.nextLoadLevel = hls.currentLevel - 1;
+        hls.startLoad(-1);
+      } catch (err) {
+        devlog("卡顿自救失败", err instanceof Error ? err.message : String(err), "error");
+      }
+    };
     const armWatchdog = () => {
       if (stallTimer || playbackFailed) return;
-      markStallAnchor();
       stallTimer = window.setInterval(() => {
-        if (playbackFailed || art !== activeArt) return;
+        if (playbackFailed || switchingLine || art !== activeArt) return;
         const current = player.querySelector("video");
         if (!current) return;
-        if (!hasPlayed && !playRequested) {
-          // 用户尚未要求播放（未点播放且未自动播放成功）：不是卡顿。
-          markStallAnchor();
-          return;
-        }
-        if (current.paused || current.seeking || current.ended) {
-          // 用户暂停或主动拖动进度条：不是卡顿，重置基准。
-          markStallAnchor();
-          return;
-        }
-        if (current.readyState >= 3) {
-          // 缓冲充足：正常状态或已恢复，重置基准。
-          markStallAnchor();
-          return;
-        }
-        const stalledFor = (Date.now() - stallAnchorAt) / 1000;
-        const progressed = Math.abs(current.currentTime - stallAnchorTime);
-        if (progressed >= STALL_PROGRESS) {
-          // 仍在缓慢推进，暂不换线。
-          markStallAnchor();
-          return;
-        }
-        if (stalledFor < STALL_SECONDS) return;
-        devlog("卡顿超时", {
-          currentTime: Math.round(current.currentTime * 10) / 10,
-          progressed: Math.round(progressed * 100) / 100,
-          stalledSeconds: Math.round(stalledFor),
-          readyState: current.readyState,
+        const decision = monitor.tick({
           paused: current.paused,
           seeking: current.seeking,
-          hasPlayed,
+          ended: current.ended,
+          readyState: current.readyState,
+          currentTime: current.currentTime,
+          online: navigator.onLine !== false,
+        }, Date.now());
+        if (decision.action === "recover") {
+          recoverPlayback(decision);
+          return;
+        }
+        if (decision.action !== "switch") return;
+        devlog("卡顿超时", {
+          reason: decision.reason,
+          currentTime: Math.round(current.currentTime * 10) / 10,
+          readyState: current.readyState,
+          paused: current.paused,
+          stalledSeconds: Math.round((decision.stalledMs ?? decision.blockedMs ?? 0) / 100) / 10,
+          stalls: decision.count ?? "-",
+          stalledTotalSeconds: Number.isFinite(decision.stalledMs) && decision.reason === "chronic"
+            ? Math.round(decision.stalledMs / 100) / 10
+            : "-",
         }, "warn");
         stopWatchdog();
-        failPlayback(true);
-      }, 1000);
+        failPlayback(true, decision.reason);
+      }, monitor.tickMs);
     };
-    const activeArt = art;
-    // 看门狗完全独立运行，不监听 waiting：真实卡顿时 waiting 会高频重复派发，
-    // 任何"收到事件就重置计时或停表"的写法都会让阈值永远计不满。
+    resumeWatchdog = () => {
+      playbackFailed = false;
+      monitor.reset(Date.now(), { switched: true });
+      armWatchdog();
+    };
+    monitor.reset(Date.now());
     armWatchdog();
     // 弹幕在卡顿时消失的修复：
     // 弹幕插件的渲染循环门控在 art.playing 上，而 Artplayer 的 playing 定义要求
@@ -1159,12 +1273,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     // 这里的判定改成"用户是否想看"：只要没暂停、没结束、确实播放过，就继续渲染，
     // 画面停在某一帧时弹幕保持静止，而不是整层消失。
     keepDanmakuVisibleDuringStall(activeArt);
-    art.on("video:play", () => {
-      // 自动播放被浏览器拦截时不会派发 playing，但用户确实要求过播放。
-      playRequested = true;
-    });
     art.on("video:playing", () => {
-      hasPlayed = true;
       playbackFailed = false;
       armWatchdog();
       if (status.classList.contains("loading")) setStatus("", "");

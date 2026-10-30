@@ -27,13 +27,12 @@ function iqiyiEpisodes(videos) {
   for (const video of videos) {
     const pageUrl = officialPage(video?.pageUrl || video?.playUrl);
     if (!pageUrl || seen.has(pageUrl) || pageUrl.includes("immersiveShort")) continue;
-    seen.add(pageUrl);
+    // 花絮、专访、番外等非正片的 number 是文字，只有正片是纯数字。
     const number = plainText(video?.number);
+    if (!/^\d+$/.test(number)) continue;
+    seen.add(pageUrl);
     const subtitle = plainText(video?.subtitle);
-    const name = /^\d+$/.test(number)
-      ? (subtitle ? `第${number}集 ${subtitle}` : `第${number}集`)
-      : (subtitle || plainText(video?.title));
-    if (!name) continue;
+    const name = subtitle ? `第${number}集 ${subtitle}` : `第${number}集`;
     episodes.push({ name, pageUrl });
   }
   return episodes;

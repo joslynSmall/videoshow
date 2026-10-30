@@ -30,6 +30,8 @@ export function mapBilibiliSeason(payload) {
   const episodes = [];
   const seen = new Set();
   for (const row of rows) {
+    // section_type 非 0 的是预告，沿用正片集号并排在会员正片之前。
+    if (Number(row?.section_type) > 0 || plainText(row?.badge) === "预告") continue;
     const pageUrl = httpsPage(row?.share_url || row?.link, "bilibili.com");
     if (!pageUrl || seen.has(pageUrl)) continue;
     seen.add(pageUrl);

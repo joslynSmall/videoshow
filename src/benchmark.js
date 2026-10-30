@@ -1,3 +1,4 @@
+import { AppError } from "./errors.js";
 import { fetchPublicMedia } from "./media.js";
 
 const DEFAULT_BENCHMARK_TIMEOUT_MS = 4000;
@@ -42,6 +43,20 @@ export function extractFirstSegmentUrl(m3u8Text, m3u8Url) {
     return resolveSegmentUrl(m3u8Url, line);
   }
   return null;
+}
+
+// 服务端测速没跑完不等于播不了：超时、网络错误、服务端 DNS 校验被拦（例如 Fake-IP 环境）
+// 都只说明"这次没测成"，浏览器是直接取分片的。只有 HTTP 状态码、内容类型这类明确的内容问题才算不可用。
+function isInconclusiveFailure(err) {
+  return err?.name === "AbortError" || err?.name === "TimeoutError" ||
+    err instanceof AppError || err?.message === "fetch failed";
+}
+
+// 吞吐优先：HLS 持续播放要求吞吐大于码率，首字节只影响起播。
+// speedKBps 是从发起请求起算的，已经含首字节耗时，这里只做轻微的二次扣分，
+// 避免低延迟但吞吐不足的线路压过高吞吐线路。
+export function scoreStream(speedKBps, ttfbMs) {
+  return Math.round(speedKBps / (1 + ttfbMs / 1000));
 }
 
 export async function benchmarkStream(playUrl, type, options = {}) {
@@ -108,7 +123,7 @@ export async function benchmarkStream(playUrl, type, options = {}) {
     const tEnd = performance.now();
     const totalMs = Math.max(1, tEnd - t0);
     const speedKBps = Math.round(bytes / 1024 / (totalMs / 1000));
-    const score = Math.round(speedKBps / Math.max(0.1, ttfbMs / 1000));
+    const score = scoreStream(speedKBps, ttfbMs);
 
     return {
       available: true,
@@ -119,6 +134,16 @@ export async function benchmarkStream(playUrl, type, options = {}) {
       score,
     };
   } catch (err) {
+    if (isInconclusiveFailure(err)) {
+      return {
+        available: true,
+        unmeasured: true,
+        error: err.message,
+        ttfbMs: null,
+        speedKBps: 0,
+        score: 0,
+      };
+    }
     return {
       available: false,
       error: err.message,
@@ -186,6 +211,9 @@ export async function raceAndSelect(candidates, options = {}) {
     score: c.metric.score,
     available: c.metric.available,
     selected: winner !== null && c === winner,
+    ...(c.metric.unmeasured ? { unmeasured: true } : {}),
+    ...(c.metric.error ? { error: c.metric.error } : {}),
+    ...(c.metric.status ? { status: c.metric.status } : {}),
   }));
 
   return {

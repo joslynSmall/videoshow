@@ -321,11 +321,15 @@ input {
 }
 
 .status {
-  min-height: 22px;
   margin: 12px 0 0;
   font-size: 13px;
   line-height: 1.6;
   color: var(--muted);
+}
+
+/* 无提示时不占据任何高度，避免搜索框下方留白 */
+.status:empty {
+  margin: 0;
 }
 
 .status.error {
@@ -805,6 +809,71 @@ input {
   font-size: 12px;
 }
 
+/* 全局 Loading 遮罩层 */
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 12, 11, 0.72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  padding: 20px;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.loading-overlay[hidden] {
+  display: none !important;
+}
+
+.loading-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 24px 32px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.6);
+  max-width: 90vw;
+}
+
+.loading-spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--line-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.loading-text {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  letter-spacing: 0.01em;
+  text-align: center;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* 模态弹窗系统 */
 .modal-backdrop {
   position: fixed;
@@ -1191,102 +1260,303 @@ input {
   }
 }
 
-/* 开发日志：渠道选择与自动换线 */
-.devlog {
+/* Channel Console 浮动按钮与面板 */
+.devlog-toggle-btn {
   position: fixed;
   left: 16px;
   bottom: 18px;
   z-index: 95;
-  max-width: min(560px, calc(100vw - 32px));
-  color: var(--muted);
-  font: 11px/1.45 var(--mono);
-}
-
-.devlog > summary {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 8px;
+  gap: 6px;
+  padding: 4px 12px;
   border: 1px solid var(--line-strong);
   border-radius: 999px;
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
   color: var(--muted);
-  font-size: 10px;
+  font: 11px/1.4 var(--mono);
   letter-spacing: 0.08em;
-  opacity: 0.45;
+  opacity: 0.7;
   cursor: pointer;
   user-select: none;
-  list-style: none;
+  transition: all 0.2s ease;
 }
 
-.devlog > summary::-webkit-details-marker {
-  display: none;
-}
-
-.devlog:hover > summary,
-.devlog[open] > summary {
+.devlog-toggle-btn:hover {
   opacity: 1;
   border-color: var(--accent);
   color: var(--accent);
 }
 
-.devlog[open] > summary {
-  border-radius: 8px 8px 0 0;
+.dev-console-pane {
+  max-width: 860px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
 }
 
-#devlog-count:not([hidden]) {
-  color: var(--accent);
+.dev-auth-gate {
+  padding: 40px 20px;
+  display: flex;
+  justify-content: center;
 }
 
-.devlog-panel {
-  width: min(560px, calc(100vw - 32px));
-  max-height: 44vh;
-  overflow: auto;
-  padding: 8px 10px 10px;
+.dev-auth-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(360px, 100%);
+}
+
+.dev-auth-label {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 550;
+}
+
+.dev-auth-row {
+  display: flex;
+  gap: 8px;
+}
+
+.dev-auth-row input {
+  flex: 1;
+  height: 38px;
+  padding: 0 12px;
   border: 1px solid var(--line-strong);
-  border-top: 0;
-  border-radius: 0 10px 10px 10px;
-  background: color-mix(in srgb, var(--surface) 94%, transparent);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(8px);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
 }
 
-.devlog-head {
+.dev-auth-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.dev-auth-gate[hidden],
+.dev-console-body[hidden],
+.dev-tab-panel[hidden] {
+  display: none !important;
+}
+
+.dev-console-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.dev-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 0 18px 12px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+
+.dev-tab-panel {
+  padding: 16px 18px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.dev-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dev-health-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.health-stat-card {
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.health-stat-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.health-stat-value {
+  margin-top: 4px;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent);
+  font-family: var(--mono);
+}
+
+.dev-health-list,
+.dev-channel-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.channel-item-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  color: var(--accent);
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-size: 12.5px;
+}
+
+.channel-item-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.channel-item-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.channel-type-badge {
   font-size: 10px;
-  letter-spacing: 0.04em;
-}
-
-.devlog-head button {
-  padding: 1px 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-2);
   border: 1px solid var(--line-strong);
-  border-radius: 5px;
-  background: transparent;
   color: var(--muted);
-  font: inherit;
-  cursor: pointer;
+  font-family: var(--mono);
 }
 
-.devlog-head button:hover {
-  border-color: var(--accent);
+.channel-state-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.channel-state-badge.is-active {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+}
+
+.channel-state-badge.is-removed {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
+}
+
+.channel-state-badge.is-disabled {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.channel-item-endpoint {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-add-card {
+  margin-bottom: 20px;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+}
+
+.channel-card-heading {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.channel-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.channel-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.channel-field label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.channel-field input,
+.channel-field select {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.channel-field-full {
+  grid-column: 1 / -1;
+}
+
+.channel-form-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+.channel-form-tip {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.channel-form-tip.is-error {
+  color: var(--danger);
+}
+
+.channel-form-tip.is-success {
   color: var(--accent);
 }
 
 .devlog-list {
   display: grid;
-  gap: 3px;
-  margin: 7px 0 0;
+  gap: 4px;
+  margin: 0;
   padding: 0;
   list-style: none;
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
 .devlog-item {
   white-space: pre-wrap;
   word-break: break-word;
+  line-height: 1.5;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--line);
 }
 
 .devlog-item .t {
@@ -1296,6 +1566,7 @@ input {
 .devlog-item .e {
   margin-left: 6px;
   color: var(--accent);
+  font-weight: 600;
 }
 
 .devlog-item .d {
@@ -1307,6 +1578,8 @@ input {
 }
 
 .devlog-item.is-error .e {
+  color: var(--danger);
+}
   color: var(--danger);
 }
 

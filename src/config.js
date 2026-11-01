@@ -37,6 +37,7 @@ export const config = {
   parseGraceMs: intEnv("PARSE_GRACE_MS", 3000),
   channelConfigUrl: process.env.CHANNEL_CONFIG_URL || "",
   channelConfigRefreshMs: intEnv("CHANNEL_CONFIG_REFRESH_MS", 600000),
+  devPassword: process.env.DEV_PASSWORD || "adminysdev",
   // 渠道健康账本的落盘位置；Serverless 环境文件系统不可持久，默认只用内存。设为空字符串可关闭落盘。
   channelStateFile: process.env.CHANNEL_STATE_FILE !== undefined
     ? process.env.CHANNEL_STATE_FILE

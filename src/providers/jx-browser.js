@@ -21,19 +21,26 @@ export function isRetryableBrowserError(err) {
   return err?.code === "PARSE_FAILED";
 }
 
-export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
+export async function resolveWithBrowser(
+  sourceUrl,
+  timeoutMs = 15000,
+  {
+    endpoint = "https://jx.1ljx.com/_player/?tk=&url=",
+    provider = "jx-browser",
+  } = {},
+) {
   if (!fs.existsSync(chromeBin())) {
     throw new AppError("BROWSER_UNAVAILABLE", 503, "无头 Chrome 未安装");
   }
   let lastError = null;
   for (let attempt = 1; attempt <= BROWSER_RETRY_ATTEMPTS; attempt += 1) {
     try {
-      return await resolveOnce(sourceUrl, timeoutMs);
+      return await resolveOnce(sourceUrl, timeoutMs, { endpoint, provider });
     } catch (err) {
       lastError = err;
       if (!isRetryableBrowserError(err) || attempt === BROWSER_RETRY_ATTEMPTS) throw err;
       log.warn("browser.resolve.retry", {
-        provider: "jx-browser",
+        provider,
         attempt,
         code: err?.code,
         message: err?.message,
@@ -44,7 +51,7 @@ export async function resolveWithBrowser(sourceUrl, timeoutMs = 15000) {
   throw lastError;
 }
 
-async function resolveOnce(sourceUrl, timeoutMs) {
+async function resolveOnce(sourceUrl, timeoutMs, { endpoint, provider }) {
   const dataDir = chromeDataDir("vs-chrome");
   fs.mkdirSync(dataDir, { recursive: true });
 
@@ -160,8 +167,10 @@ async function resolveOnce(sourceUrl, timeoutMs) {
       }
     });
 
-    const jxPlayerUrl = "https://jx.1ljx.com/_player/?tk=&url=" + encodeURIComponent(sourceUrl);
-    await send(pageWs, "Page.navigate", { url: jxPlayerUrl });
+    const targetPlayerUrl = endpoint.endsWith("=")
+      ? endpoint + encodeURIComponent(sourceUrl)
+      : endpoint.replace(/(=)[^=&]*$/, `$1${encodeURIComponent(sourceUrl)}`);
+    await send(pageWs, "Page.navigate", { url: targetPlayerUrl });
 
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -192,7 +201,7 @@ async function resolveOnce(sourceUrl, timeoutMs) {
       playUrl,
       type: inferPlaybackType(playUrl),
       expiresAtMs: Date.now() + 3600 * 1000,
-      provider: "jx-browser",
+      provider: provider || "jx-browser",
     };
   } finally {
     try { pageWs?.close(); } catch {}

@@ -58,6 +58,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   const siteSearchList = document.querySelector("#site-search-list");
   const closeSiteSearchBtn = document.querySelector("#close-site-search");
 
+  const loadingOverlay = document.querySelector("#loading-overlay");
+  const loadingText = document.querySelector("#loading-text");
   const episodesBar = document.querySelector("#episodes-bar");
   const platformBar = document.querySelector("#platform-bar");
   const episodesScroll = document.querySelector("#episodes-scroll");
@@ -86,7 +88,34 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   // 新线路必须在这段时间内出数据（比起播判定的 10 秒略宽），否则视为本次换线失败。
   const SWITCH_TIMEOUT_MS = 12000;
 
-  const devlogEl = document.querySelector("#devlog");
+  const devModal = document.querySelector("#dev-modal");
+  const devConsoleToggle = document.querySelector("#dev-console-toggle");
+  const closeDevModalBtn = document.querySelector("#close-dev-modal");
+  const devAuthGate = document.querySelector("#dev-auth-gate");
+  const devAuthForm = document.querySelector("#dev-auth-form");
+  const devPasswordInput = document.querySelector("#dev-password-input");
+  const devAuthError = document.querySelector("#dev-auth-error");
+  const devConsoleBody = document.querySelector("#dev-console-body");
+
+  const devTabPlayback = document.querySelector("#dev-tab-playback");
+  const devTabHealth = document.querySelector("#dev-tab-health");
+  const devTabManage = document.querySelector("#dev-tab-manage");
+  const devPanelPlayback = document.querySelector("#dev-panel-playback");
+  const devPanelHealth = document.querySelector("#dev-panel-health");
+  const devPanelManage = document.querySelector("#dev-panel-manage");
+
+  const devRefreshHealthBtn = document.querySelector("#dev-refresh-health");
+  const devSyncRemoteBtn = document.querySelector("#dev-sync-remote");
+  const devHealthSummary = document.querySelector("#dev-health-summary");
+  const devHealthList = document.querySelector("#dev-health-list");
+
+  const devChannelAddForm = document.querySelector("#dev-channel-add-form");
+  const devChannelItems = document.querySelector("#dev-channel-items");
+  const channelFormTip = document.querySelector("#channel-form-tip");
+
+  const DEV_AUTH_SESSION_KEY = "videoshow_dev_authed_v1";
+  const DEFAULT_DEV_PASSWORD = "adminysdev";
+
   const devlogList = document.querySelector("#devlog-list");
   const devlogCount = document.querySelector("#devlog-count");
   const devlogClear = document.querySelector("#devlog-clear");
@@ -130,10 +159,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       devlogCount.textContent = String(devlogEntries.length);
       devlogCount.hidden = devlogEntries.length === 0;
     }
-    if (devlogEl?.open) {
-      const panel = devlogEl.querySelector(".devlog-panel");
-      if (panel) panel.scrollTop = panel.scrollHeight;
-    }
   }
 
   function devlog(event, detail = "", level = "info") {
@@ -147,89 +172,24 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     renderDevlog();
   }
 
-  function devlogCandidates(label, candidates) {
-    for (const item of candidates || []) {
-      devlog(label, {
-        provider: item.provider,
-        kind: item.kind || "-",
-        available: item.available,
-        verified: item.verified,
-        singleUse: item.singleUse,
-        ttfbMs: item.ttfbMs ?? "-",
-        speedKBps: item.speedKBps ?? "-",
-        score: item.score ?? "-",
-        selected: item.selected,
-        host: hostOf(item.playUrl),
-      }, item.available === false ? "warn" : "info");
+  function formatReason(candidate, fallbackRule = "") {
+    if (!candidate) return fallbackRule || "首选可用";
+    if (candidate.singleUse) return "单次签名链接（已通过可用性验证）";
+    if (typeof candidate.ttfbMs === "number" && Number.isFinite(candidate.ttfbMs)) {
+      return `测速耗时最快 (${Math.round(candidate.ttfbMs)}ms)`;
     }
+    return fallbackRule || "综合评分最高且可用";
   }
 
-  function devlogLatencyRanking(data, nowMs = Date.now()) {
-    const candidates = new Map((data.candidates || []).map((item) => [item.provider, item]));
-    const rows = (data.diagnostics || []).map((item) => {
-      const candidate = candidates.get(item.provider);
-      return {
-        provider: item.provider,
-        kind: item.kind || candidate?.kind || "-",
-        status: item.status,
-        resolveMs: item.ms,
-        ttfbMs: item.ttfbMs ?? candidate?.ttfbMs ?? null,
-        speedKBps: item.speedKBps ?? candidate?.speedKBps ?? null,
-        score: item.score ?? candidate?.score ?? null,
-        selected: candidate?.selected === true,
-        code: item.code,
-        message: item.message,
-        detail: item.detail,
-        // 剩余寿命：单次签名链接会在几十秒后过期，不打印的话
-        // 排行看起来“还有几条可用”，实际换线时可能已全部失效。
-        expiresInSec: Number.isFinite(candidate?.expiresAtMs)
-          ? Math.round((candidate.expiresAtMs - nowMs) / 1000)
-          : null,
-      };
-    });
-    if (!rows.length) return;
-    const group = (item) => {
-      if (item.status === "benchmarked") return 0;
-      if (item.status === "single-use") return 1;
-      if (item.status === "rejected" || item.status === "benchmark-rejected") return 2;
-      return 3;
+  function devlogSelection(data) {
+    const selected = (data.candidates || []).find((item) => item.selected) || {
+      provider: data.provider,
+      singleUse: data.singleUse,
     };
-    rows.sort((a, b) =>
-      group(a) - group(b) ||
-      (group(a) === 0
-        ? (a.ttfbMs ?? Infinity) - (b.ttfbMs ?? Infinity) ||
-          (b.speedKBps ?? 0) - (a.speedKBps ?? 0)
-        : (a.resolveMs ?? Infinity) - (b.resolveMs ?? Infinity)));
-    const lines = rows.map((item, index) => {
-      const parts = [
-        `${index + 1}. ${item.provider}`,
-        `类型=${item.kind}`,
-        `status=${item.status}`,
-        `解析耗时=${item.resolveMs ?? "-"}ms`,
-      ];
-      if (item.status === "benchmarked") {
-        parts.push(
-          `TTFB=${item.ttfbMs ?? "-"}ms`,
-          `速度=${item.speedKBps ?? "-"}KB/s`,
-          `score=${item.score ?? "-"}`,
-        );
-      } else if (item.status === "single-use") {
-        parts.push("TTFB=未测速", "速度=未测速");
-      } else if (item.code || item.message) {
-        parts.push(`error=${[item.code, item.message].filter(Boolean).join(":")}`);
-        if (item.detail) parts.push(`detail=${devlogValue(item.detail)}`);
-      }
-      if (item.selected) parts.push("selected");
-      if (Number.isFinite(item.expiresInSec)) {
-        parts.push(item.expiresInSec > 0 ? `剩余=${item.expiresInSec}s` : "已过期");
-      }
-      return parts.join(" ");
-    });
-    devlog(
-      "渠道延迟排行",
-      "\n排序：已验证按 TTFB 升序，单次链接/失败按解析耗时\n" + lines.join("\n"),
-      "info",
-    );
+    const provider = selected.provider || data.provider || "未知";
+    const host = hostOf(data.playUrl);
+    const reason = formatReason(selected);
+    devlog("已选择线路", `【${provider}】(主机: ${host || "-"} | 原因: ${reason})`, "info");
   }
 
   if (devlogClear) {
@@ -238,6 +198,267 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       renderDevlog();
     });
   }
+
+  /* =========================================================================
+     Channel Console (控制台、密码鉴权、Tab 切换与渠道维护)
+     ========================================================================= */
+  let devConsoleAuthed = false;
+  try {
+    devConsoleAuthed = sessionStorage.getItem(DEV_AUTH_SESSION_KEY) === "1";
+  } catch {}
+
+  function openDevConsole() {
+    if (!devModal) return;
+    devModal.hidden = false;
+    if (devConsoleAuthed) {
+      devAuthGate.hidden = true;
+      devConsoleBody.hidden = false;
+      renderHealthTab();
+      renderManageTab();
+    } else {
+      devAuthGate.hidden = false;
+      devConsoleBody.hidden = true;
+      devPasswordInput.value = "";
+      devAuthError.hidden = true;
+      setTimeout(() => devPasswordInput.focus(), 50);
+    }
+  }
+
+  function closeDevConsole() {
+    if (devModal) devModal.hidden = true;
+  }
+
+  devConsoleToggle?.addEventListener("click", openDevConsole);
+  closeDevModalBtn?.addEventListener("click", closeDevConsole);
+  devModal?.addEventListener("click", (e) => {
+    if (e.target === devModal) closeDevConsole();
+  });
+
+  devAuthForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const pwd = devPasswordInput.value.trim();
+    // 双重校验：优先走后端验证，若离线/服务异常则本地校验兜底
+    let verified = false;
+    try {
+      const res = await fetch("/api/dev/auth", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: pwd })
+      });
+      const data = await res.json();
+      verified = res.ok && data?.ok === true;
+    } catch {
+      verified = pwd === DEFAULT_DEV_PASSWORD;
+    }
+
+    if (verified) {
+      devConsoleAuthed = true;
+      try { sessionStorage.setItem(DEV_AUTH_SESSION_KEY, "1"); } catch {}
+      devAuthError.hidden = true;
+      devAuthGate.hidden = true;
+      devConsoleBody.hidden = false;
+      renderHealthTab();
+      renderManageTab();
+    } else {
+      devAuthError.hidden = false;
+      devPasswordInput.select();
+    }
+  });
+
+  function switchDevTab(activeTab) {
+    const tabs = [
+      { tab: devTabPlayback, panel: devPanelPlayback },
+      { tab: devTabHealth, panel: devPanelHealth },
+      { tab: devTabManage, panel: devPanelManage },
+    ];
+    for (const item of tabs) {
+      const match = item.tab === activeTab;
+      item.tab?.classList.toggle("is-active", match);
+      if (item.panel) item.panel.hidden = !match;
+    }
+    if (activeTab === devTabHealth) renderHealthTab();
+    if (activeTab === devTabManage) renderManageTab();
+  }
+
+  devTabPlayback?.addEventListener("click", () => switchDevTab(devTabPlayback));
+  devTabHealth?.addEventListener("click", () => switchDevTab(devTabHealth));
+  devTabManage?.addEventListener("click", () => switchDevTab(devTabManage));
+
+  async function fetchChannelsStatus() {
+    const res = await fetch("/api/channels");
+    const json = await res.json();
+    return json?.data || { channels: [] };
+  }
+
+  async function renderHealthTab() {
+    if (!devHealthList || !devHealthSummary) return;
+    devHealthList.innerHTML = '<p class="status loading">正在加载渠道健康账本…</p>';
+    try {
+      const data = await fetchChannelsStatus();
+      const channels = data.channels || [];
+      const activeCount = channels.filter(c => c.state === "active").length;
+      const removedCount = channels.filter(c => c.state === "removed").length;
+      const totalAttempts = channels.reduce((sum, c) => sum + (c.today?.attempts || 0), 0);
+      const totalSuccesses = channels.reduce((sum, c) => sum + (c.today?.successes || 0), 0);
+
+      devHealthSummary.innerHTML = `
+        <div class="health-stat-card">
+          <div class="health-stat-label">活跃渠道数</div>
+          <div class="health-stat-value">${activeCount} <span style="font-size:12px;color:var(--muted)">/ ${channels.length}</span></div>
+        </div>
+        <div class="health-stat-card">
+          <div class="health-stat-label">今日总调用 / 成功</div>
+          <div class="health-stat-value">${totalAttempts} <span style="font-size:12px;color:var(--accent)">/ ${totalSuccesses}</span></div>
+        </div>
+        <div class="health-stat-card">
+          <div class="health-stat-label">已熔断清理渠道</div>
+          <div class="health-stat-value" style="color:var(--danger)">${removedCount}</div>
+        </div>
+      `;
+
+      if (!channels.length) {
+        devHealthList.innerHTML = '<p class="status">暂无任何渠道记录</p>';
+        return;
+      }
+
+      devHealthList.innerHTML = channels.map(c => {
+        const stateClass = c.state === "active" ? "is-active" : c.state === "removed" ? "is-removed" : "is-disabled";
+        const stateText = c.state === "active" ? "正常运行" : c.state === "removed" ? "已熔断剔除" : "已停用";
+        const unavailDays = (c.unavailableDays || []).join(", ") || "无";
+        return `
+          <div class="channel-item-row">
+            <div class="channel-item-main">
+              <div class="channel-item-title">
+                <span>${c.name}</span>
+                <span class="channel-type-badge">${c.id}</span>
+                <span class="channel-state-badge ${stateClass}">${stateText}</span>
+              </div>
+              <div class="channel-item-endpoint">
+                今日调用: ${c.today?.attempts || 0}次 (成功 ${c.today?.successes || 0}次) · 不可用自然日: ${unavailDays} ${c.reason ? `· 原因: ${c.reason}` : ""}
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    } catch (err) {
+      devHealthList.innerHTML = `<p class="status error">加载失败: ${err instanceof Error ? err.message : String(err)}</p>`;
+    }
+  }
+
+  devRefreshHealthBtn?.addEventListener("click", renderHealthTab);
+
+  devSyncRemoteBtn?.addEventListener("click", async () => {
+    devSyncRemoteBtn.disabled = true;
+    devSyncRemoteBtn.textContent = "同步中…";
+    try {
+      const res = await fetch("/api/channels/sync", { method: "POST" });
+      const json = await res.json();
+      if (!json?.ok) throw new Error(json?.error?.message || "同步失败");
+      await renderHealthTab();
+      await renderManageTab();
+      alert(json.data?.refreshed ? "源头已成功同步并更新渠道！" : "源头同步完成（无配置地址或已是最新）");
+    } catch (err) {
+      alert(`同步失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      devSyncRemoteBtn.disabled = false;
+      devSyncRemoteBtn.textContent = "手动同步源头";
+    }
+  });
+
+  async function renderManageTab() {
+    if (!devChannelItems) return;
+    devChannelItems.innerHTML = '<p class="status loading">正在加载渠道配置…</p>';
+    try {
+      const data = await fetchChannelsStatus();
+      const channels = data.channels || [];
+      if (!channels.length) {
+        devChannelItems.innerHTML = '<p class="status">暂无渠道配置</p>';
+        return;
+      }
+      devChannelItems.innerHTML = channels.map(c => {
+        const stateClass = c.state === "active" ? "is-active" : c.state === "removed" ? "is-removed" : "is-disabled";
+        const stateText = c.state === "active" ? "启用中" : c.state === "removed" ? "已熔断" : "已停用";
+        return `
+          <div class="channel-item-row" data-channel-id="${c.id}">
+            <div class="channel-item-main">
+              <div class="channel-item-title">
+                <span>${c.name}</span>
+                <span class="channel-type-badge">${c.id}</span>
+                <span class="channel-state-badge ${stateClass}">${stateText}</span>
+              </div>
+            </div>
+            <div class="channel-item-actions">
+              ${c.state === "active"
+                ? `<button type="button" class="ghost-button mini-button danger-ghost channel-disable-btn" data-id="${c.id}">禁用</button>`
+                : `<button type="button" class="ghost-button mini-button channel-enable-btn" data-id="${c.id}">启用</button>`
+              }
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      devChannelItems.querySelectorAll(".channel-disable-btn").forEach(btn => {
+        btn.addEventListener("click", () => toggleChannel(btn.dataset.id, false));
+      });
+      devChannelItems.querySelectorAll(".channel-enable-btn").forEach(btn => {
+        btn.addEventListener("click", () => toggleChannel(btn.dataset.id, true));
+      });
+    } catch (err) {
+      devChannelItems.innerHTML = `<p class="status error">加载失败: ${err instanceof Error ? err.message : String(err)}</p>`;
+    }
+  }
+
+  async function toggleChannel(channelId, enable) {
+    try {
+      const res = await fetch("/api/channels", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          channels: [{ id: channelId, enabled: enable }]
+        })
+      });
+      const json = await res.json();
+      if (!json?.ok) throw new Error(json?.error?.message || "操作失败");
+      renderManageTab();
+      renderHealthTab();
+    } catch (err) {
+      alert(`更新渠道状态失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  devChannelAddForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = document.querySelector("#new-channel-id")?.value.trim().toLowerCase();
+    const name = document.querySelector("#new-channel-name")?.value.trim();
+    const type = document.querySelector("#new-channel-type")?.value;
+    const endpoint = document.querySelector("#new-channel-endpoint")?.value.trim();
+
+    channelFormTip.textContent = "正在提交…";
+    channelFormTip.className = "channel-form-tip";
+
+    try {
+      const res = await fetch("/api/channels", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          channels: [{ id, name, type, endpoint, enabled: true }]
+        })
+      });
+      const json = await res.json();
+      if (!json?.ok || json?.data?.rejected?.length) {
+        const reason = json?.data?.rejected?.[0]?.reason || json?.error?.message || "添加失败";
+        throw new Error(reason);
+      }
+      channelFormTip.textContent = "添加成功！";
+      channelFormTip.className = "channel-form-tip is-success";
+      devChannelAddForm.reset();
+      renderManageTab();
+      renderHealthTab();
+    } catch (err) {
+      channelFormTip.textContent = `失败: ${err instanceof Error ? err.message : String(err)}`;
+      channelFormTip.className = "channel-form-tip is-error";
+    }
+  });
 
   devlog("初始化", "选择规则：可用优先 > 已验证优先 > score 高 > TTFB 低；冰豆仅在无可用主线路时回退");
 
@@ -280,14 +501,14 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   // 播放器上的快进/快退按钮。手机上没有物理键盘，默认的方向键快进不可用，
   // 所以在控制区追加两个可点按钮，每次跳转 SEEK_BUTTON_STEP 秒。
-  function seekButton(name, step, label, glyph) {
+  // 使用与 Artplayer 控制栏一致的 SVG 图标与样式。
+  function seekButton(name, step, label, svgPaths, index) {
     return {
       name,
       position: "right",
-      index: 11,
-      // Artplayer 会把 html 包进自己的 .art-control 容器，所以内层不能再用 art-control 类名，
-      // 否则选择器会命中两层、尺寸被覆盖两次。
-      html: `<div class="seek-btn-inner" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;cursor:pointer"><span style="font-size:16px;line-height:1">${glyph}</span></div>`,
+      index,
+      tooltip: label,
+      html: `<i class="art-icon art-icon-${name}" style="display:flex;align-items:center;justify-content:center;width:100%;height:100%"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">${svgPaths}</svg></i>`,
       click: () => {
         if (!art || switchingLine) return;
         const duration = Number(art.duration);
@@ -530,10 +751,18 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     status.className = kind ? `status ${kind}` : "status";
   }
 
-  function setLoading(loading) {
+  function setLoading(loading, message = "") {
     submit.disabled = loading;
     submit.textContent = loading ? "解析中…" : "解析";
     form.setAttribute("aria-busy", String(loading));
+    if (loadingOverlay) {
+      if (loading) {
+        if (loadingText && message) loadingText.textContent = message;
+        loadingOverlay.hidden = false;
+      } else {
+        loadingOverlay.hidden = true;
+      }
+    }
   }
 
   function formatExpiry(value) {
@@ -551,7 +780,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   function destroyPlayer() {
     if (art) {
-      art.destroy();
+      art.destroy(false);
       art = null;
     }
   }
@@ -835,78 +1064,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return title.replace(/(\s+第\d+集|\s+全集|\s+正片)+/gi, "").trim() || title;
   }
 
-  async function pickFasterSource(sourceUrl, failedPlayUrls, hosts = {}, refreshed = false) {
-    const avoidHosts = hosts.avoidHosts || [];
-    const blockedHosts = hosts.blockedHosts || [];
-    devlog("重新测速", {
-      excluded: failedPlayUrls.length,
-      avoidHosts: avoidHosts.join(",") || "-",
-      blockedHosts: blockedHosts.join(",") || "-",
-      refreshed,
-    }, "info");
-    try {
-      const response = await fetch("/api/race", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json",
-        },
-        body: JSON.stringify({ sourceUrl, failedPlayUrls, avoidHosts, blockedHosts }),
-      });
-      const payload = await response.json();
-      const candidates = payload?.data?.candidates || [];
-      const selected = payload?.data?.selected;
-      devlog("race 响应", {
-        status: response.status,
-        selected: selected?.provider || "none",
-        host: hostOf(selected?.playUrl),
-        available: candidates.filter((item) => item.available !== false).length,
-        total: candidates.length,
-        filtered: payload?.data?.filtered,
-      }, selected ? "info" : "warn");
-      devlogCandidates("race 候选", candidates);
-      const raceRanked = [...candidates].sort((a, b) =>
-        Number(b.available !== false) - Number(a.available !== false) ||
-        (b.score ?? 0) - (a.score ?? 0) ||
-        (a.ttfbMs ?? Infinity) - (b.ttfbMs ?? Infinity));
-      const raceNow = Date.now();
-      if (raceRanked.length) {
-        devlog("race 排行", "\n" + raceRanked.map((item, index) => {
-          const flags = [item.selected ? "selected" : "", item.singleUse ? "singleUse" : ""]
-            .filter(Boolean).join(" ");
-          const life = Number.isFinite(item.expiresAtMs)
-            ? (item.expiresAtMs > raceNow ? ` 剩余=${Math.round((item.expiresAtMs - raceNow) / 1000)}s` : " 已过期")
-            : "";
-          return `${index + 1}. ${item.provider} 类型=${item.kind || "-"} TTFB=${item.ttfbMs ?? "-"}ms 速度=${item.speedKBps ?? "-"}KB/s score=${item.score ?? "-"}${life}${flags ? ` ${flags}` : ""}`;
-        }).join("\n"), "info");
-      }
-      if (response.status === 409 && !refreshed) {
-        devlog("race 缓存过期", "强制重新解析后重试", "warn");
-        await parse(sourceUrl, { force: true });
-        return pickFasterSource(sourceUrl, failedPlayUrls, hosts, true);
-      }
-      if (response.ok && selected?.playUrl && selected.available !== false) return selected;
-      if (response.ok && !selected && !refreshed) {
-        devlog("race 无候选", "强制重新解析以刷新单次签名地址", "warn");
-        try {
-          await parse(sourceUrl, { force: true });
-        } catch (err) {
-          devlog("重新解析失败", err instanceof Error ? err.message : String(err), "error");
-          return null;
-        }
-        return pickFasterSource(sourceUrl, failedPlayUrls, hosts, true);
-      }
-      devlog("race 无可用候选", {
-        status: response.status,
-        filtered: payload?.data?.filtered,
-      }, "warn");
-    } catch (err) {
-      devlog("race 失败", err instanceof Error ? err.message : String(err), "error");
-      console.warn("重新测速失败", err);
-    }
-    return null;
-  }
-
   // 起播失败和播放列表取不到说明域名连不上（计 2 次，直接排除）；卡顿之类只计 1 次。
   function failureWeight(reason) {
     return reason === "startup" || reason === "unreachable" ? 2 : 1;
@@ -920,6 +1077,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     const instance = art;
     const continueAt = Number.isFinite(instance.currentTime) ? instance.currentTime : 0;
     const failed = new Set(Array.isArray(data.failedPlayUrls) ? data.failedPlayUrls : []);
+    let hasRefreshed = false;
     // 按域名累计失败次数：失败 1 次后换线优先选其他域名，失败 2 次就不再尝试该域名，
     // 避免在同一个已失效的域名（例如多个解析渠道共用同一个 CDN）上反复浪费时间。
     const hostFails = new Map(Object.entries(data.failedHostCounts || {}));
@@ -927,10 +1085,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       const host = hostOf(url);
       if (host) hostFails.set(host, (hostFails.get(host) || 0) + weight);
     };
-    const hostLists = () => ({
-      avoidHosts: [...hostFails].filter(([, count]) => count >= 1).map(([host]) => host),
-      blockedHosts: [...hostFails].filter(([, count]) => count >= 2).map(([host]) => host),
-    });
     if (data.playUrl) {
       failed.add(data.playUrl);
       bumpHost(data.playUrl, failureWeight(reason));
@@ -945,29 +1099,59 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       continueAt: Math.round(continueAt),
       failed: failed.size,
     }, "warn");
+    // 选择下一个可用线路：优先使用已按质量/TTFB排好序的本地 candidates 列表
+    function selectNextCandidate() {
+      const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+      const nowMs = Date.now();
+      for (const item of candidates) {
+        if (!item?.playUrl) continue;
+        if (failed.has(item.playUrl)) continue;
+        // 单次签名已明确过期的跳过
+        if (Number.isFinite(item.expiresAtMs) && item.expiresAtMs <= nowMs) continue;
+        // 若该域名已连续失败 >= 2 次，跳过以避免在相同挂掉的 CDN 域名上轮训
+        const h = hostOf(item.playUrl);
+        if (h && (hostFails.get(h) || 0) >= 2) continue;
+        return item;
+      }
+      return null;
+    }
+
     try {
-      for (let attempts = 0; attempts < 8; attempts += 1) {
-        devlog("换线尝试", { attempt: attempts + 1, excluded: failed.size }, "info");
-        const chosen = await pickFasterSource(data.sourceUrl, [...failed], hostLists());
-        if (art !== instance) {
-          devlog("换线中止", "播放器已重建", "warn");
-          return;
+      while (true) {
+        let chosen = selectNextCandidate();
+
+        // 本地候选已耗尽，如果尚未尝试过重新解析，则 force=1 刷新一轮
+        if (!chosen && !hasRefreshed) {
+          devlog("候选已耗尽", "请求后端重新解析以刷新签名及候选列表…", "warn");
+          try {
+            hasRefreshed = true;
+            const fresh = await parse(data.sourceUrl, { force: true });
+            if (art !== instance) return;
+            if (Array.isArray(fresh?.candidates)) {
+              data.candidates = fresh.candidates;
+              chosen = selectNextCandidate();
+            }
+          } catch (err) {
+            devlog("重新解析失败", err instanceof Error ? err.message : String(err), "error");
+          }
         }
-        if (!chosen?.playUrl || failed.has(chosen.playUrl)) {
-          devlog("换线结束", chosen?.playUrl ? "候选已被标记失败" : "没有可用候选", "warn");
+
+        if (!chosen?.playUrl) {
+          devlog("切源结束", "所有可用备选线路均已尝试完毕", "warn");
           break;
         }
-        devlog("切换线路", {
-          from: data.provider || "-",
-          to: chosen.provider || "-",
-          fromHost: hostOf(data.playUrl),
-          toHost: hostOf(chosen.playUrl),
-          type: chosen.type,
-          singleUse: chosen.singleUse === true,
-          ttfbMs: chosen.ttfbMs ?? "-",
-          speedKBps: chosen.speedKBps ?? "-",
-        }, "warn");
+
         failed.add(chosen.playUrl);
+        const fromProvider = data.provider || "未知";
+        const toProvider = chosen.provider || "未知";
+        const toHost = hostOf(chosen.playUrl);
+        const switchReasonText =
+          reason === "startup" ? "原源起播超时" :
+          reason === "hard" ? "原源播放连续断流(>5s)" :
+          reason === "unreachable" ? "原源播放列表无法访问" : (reason || "播放异常");
+
+        devlog("切换线路", `【${fromProvider} -> ${toProvider}】(新主机: ${toHost || "-"} | 原因: ${switchReasonText})`, "warn");
+
         try {
           instance.activeHlsUrl = null;
           instance.hls?.destroy();
@@ -995,17 +1179,14 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           if (art !== instance) return;
           reportPlayback("playback.switch", {
             fromHost: hostOf(data.playUrl),
-            toHost: hostOf(chosen.playUrl),
+            toHost: toHost,
             episode: data.episodeName || "",
             continueAt,
           });
-          devlog("换线成功", {
-            provider: chosen.provider || "-",
-            host: hostOf(chosen.playUrl),
-            at: Math.round(continueAt),
-          }, "info");
+          devlog("换线成功", `【已切至: ${toProvider}】(继续播放位置: ${Math.round(continueAt)}s)`, "info");
           data.playUrl = chosen.playUrl;
           data.type = chosen.type;
+          data.provider = chosen.provider;
           data.failedPlayUrls = [...failed].filter((url) => url !== chosen.playUrl);
           if (currentMedia) {
             currentMedia.playUrl = chosen.playUrl;
@@ -1017,11 +1198,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           return;
         } catch (err) {
           bumpHost(chosen.playUrl, err?.weight || 1);
-          devlog("换线失败", {
-            host: hostOf(chosen.playUrl),
-            failures: hostFails.get(hostOf(chosen.playUrl)) || 0,
-            reason: err instanceof Error ? err.message : String(err),
-          }, "error");
+          devlog("换线失败", `【${toProvider}】加载失败: ${err instanceof Error ? err.message : String(err)}`, "error");
           console.warn("线路切换失败", err);
         }
       }
@@ -1057,42 +1234,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   function showResult(data) {
     clearStallTimer();
-    devlog("解析结果", {
-      provider: data.provider || "-",
-      type: data.type || "-",
-      host: hostOf(data.playUrl),
-      singleUse: data.singleUse === true,
-      verified: data.verified !== false,
-      cached: data.cached === true,
-    }, data.singleUse ? "warn" : "info");
-    for (const item of data.diagnostics || []) {
-      devlog("渠道诊断", {
-        provider: item.provider,
-        kind: item.kind || "-",
-        status: item.status,
-        ms: item.ms,
-        code: item.code,
-        message: item.message,
-        detail: item.detail,
-        ttfbMs: item.ttfbMs ?? "-",
-        speedKBps: item.speedKBps ?? "-",
-        host: item.playHost,
-      }, item.status === "rejected" || item.status === "benchmark-rejected" ? "warn" : "info");
-    }
-    devlogLatencyRanking(data);
-    devlogCandidates("候选线路", data.candidates);
-    const selectedCandidate = (data.candidates || []).find((item) => item.selected);
-    if (selectedCandidate) {
-      devlog("选择依据", {
-        rule: data.singleUse
-          ? "无已验证线路，使用单次签名链接"
-          : "可用优先 > 已验证优先 > score 高 > TTFB 低",
-        provider: selectedCandidate.provider,
-        ttfbMs: selectedCandidate.ttfbMs ?? "-",
-        speedKBps: selectedCandidate.speedKBps ?? "-",
-        score: selectedCandidate.score ?? "-",
-      }, "info");
-    }
+    devlogSelection(data);
     const baseTitle = data.baseTitle || currentMedia?.baseTitle || cleanBaseTitle(data.title);
     const displayTitle = data.episodeName ? `${baseTitle} ${data.episodeName}` : (data.title || baseTitle);
 
@@ -1171,8 +1313,20 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       pip: true,
       hotkey: true,
       controls: [
-        seekButton("seek-back", -SEEK_BUTTON_STEP, "快退", "⏪"),
-        seekButton("seek-forward", SEEK_BUTTON_STEP, "快进", "⏩"),
+        seekButton(
+          "seek-back",
+          -SEEK_BUTTON_STEP,
+          "快退10秒",
+          '<path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/>',
+          11,
+        ),
+        seekButton(
+          "seek-forward",
+          SEEK_BUTTON_STEP,
+          "快进10秒",
+          '<path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>',
+          12,
+        ),
       ],
       autoSize: false,
       theme: "#c6f36b",
@@ -1210,21 +1364,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         stallTimer = 0;
       }
     };
-    const recoverPlayback = (decision) => {
-      const hls = activeArt.hls;
-      devlog("卡顿自救", {
-        stalledSeconds: Math.round(decision.stalledMs / 100) / 10,
-        level: hls?.currentLevel ?? "-",
-        levels: hls?.levels?.length ?? 0,
-      }, "warn");
-      if (!hls) return;
-      try {
-        if (hls.levels?.length > 1 && hls.currentLevel > 0) hls.nextLoadLevel = hls.currentLevel - 1;
-        hls.startLoad(-1);
-      } catch (err) {
-        devlog("卡顿自救失败", err instanceof Error ? err.message : String(err), "error");
-      }
-    };
     const armWatchdog = () => {
       if (stallTimer || playbackFailed) return;
       stallTimer = window.setInterval(() => {
@@ -1239,10 +1378,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           currentTime: current.currentTime,
           online: navigator.onLine !== false,
         }, Date.now());
-        if (decision.action === "recover") {
-          recoverPlayback(decision);
-          return;
-        }
         if (decision.action !== "switch") return;
         devlog("卡顿超时", {
           reason: decision.reason,
@@ -1250,10 +1385,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           readyState: current.readyState,
           paused: current.paused,
           stalledSeconds: Math.round((decision.stalledMs ?? decision.blockedMs ?? 0) / 100) / 10,
-          stalls: decision.count ?? "-",
-          stalledTotalSeconds: Number.isFinite(decision.stalledMs) && decision.reason === "chronic"
-            ? Math.round(decision.stalledMs / 100) / 10
-            : "-",
         }, "warn");
         stopWatchdog();
         failPlayback(true, decision.reason);
@@ -1261,10 +1392,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     };
     resumeWatchdog = () => {
       playbackFailed = false;
-      monitor.reset(Date.now(), { switched: true });
+      monitor.reset();
       armWatchdog();
     };
-    monitor.reset(Date.now());
+    monitor.reset();
     armWatchdog();
     // 弹幕在卡顿时消失的修复：
     // 弹幕插件的渲染循环门控在 art.playing 上，而 Artplayer 的 playing 定义要求
@@ -1479,8 +1610,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       setStatus("这一集没有可解析的平台页面，请重新搜索。", "error");
       return;
     }
-    setStatus(`正在解析${episode.name || "该集"}…`, "loading");
-    setLoading(true);
+    const msg = `正在解析${episode.name || "该集"}…`;
+    // 解析进度由 loading 遮罩层承载，状态栏只负责清空旧提示
+    setStatus("", "");
+    setLoading(true, msg);
 
     try {
       const data = await parse(pageUrl);
@@ -1493,7 +1626,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         episodeIndex: index,
         episodes: currentMedia?.episodes,
       });
-      setStatus("解析成功。", "");
     } catch (err) {
       setStatus(err instanceof Error ? err.message : "解析失败，请稍后重试。", "error");
     } finally {
@@ -1680,8 +1812,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       platformId: "",
       episodes,
     };
-    setLoading(true);
-    setStatus("正在解析视频链接，请稍候…", "loading");
+    const msg = "正在解析视频链接，请稍候…";
+    setLoading(true, msg);
+    setStatus("", "");
     searchSection.hidden = true;
     try {
       const data = await withEpisodes(pageUrl, await parse(pageUrl), episodes);
@@ -1695,7 +1828,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         episodeIndex,
         episodes: data.episodes,
       });
-      setStatus("解析成功。", "");
     } catch (err) {
       setStatus(err instanceof Error ? err.message : "解析失败，请稍后重试。", "error");
     } finally {
@@ -1751,8 +1883,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   async function openTitle(item, episodeIndex) {
-    setStatus(`正在读取《${item.title || "该剧"}》的播放平台…`, "loading");
-    setLoading(true);
+    const msg = `正在读取《${item.title || "该剧"}》的播放平台…`;
+    setStatus("", "");
+    setLoading(true, msg);
     try {
       const detail = await loadTitle(item.cat, item.id);
       const platform = preferredPlatform(detail?.platforms);
@@ -1870,16 +2003,15 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     SearchHistory.save(query);
     if (searchHistory) searchHistory.hidden = true;
-    setLoading(true);
-
     if (isUrl(query)) {
       // 轨道 A：直接 URL 单集解析
-      setStatus("正在解析视频链接，请稍候…", "loading");
+      const msg = "正在解析视频链接，请稍候…";
+      setStatus("", "");
+      setLoading(true, msg);
       searchSection.hidden = true;
       try {
         const data = await withEpisodes(query, await parse(query));
         showResult(data);
-        setStatus("解析成功。", "");
       } catch (err) {
         setStatus(
           err instanceof Error ? err.message : "解析失败，请稍后重试。",
@@ -1895,7 +2027,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       searchGrid.innerHTML = "";
 
       if (channel === "sites") {
-        setStatus(`正在通过视频网站搜索《${query}》，请稍候…`, "loading");
+        const msg = `正在通过视频网站搜索《${query}》，请稍候…`;
+        setStatus("", "");
+        setLoading(true, msg);
         try {
           const sites = await searchSites(query);
           if (sites.length) {
@@ -1915,7 +2049,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         return;
       }
 
-      setStatus(`正在通过 API 渠道搜索《${query}》，请稍候…`, "loading");
+      const msg = `正在通过 API 渠道搜索《${query}》，请稍候…`;
+      setStatus("", "");
+      setLoading(true, msg);
       try {
         const items = await search(query);
         renderSearchResults(items);

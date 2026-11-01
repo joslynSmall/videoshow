@@ -27,3 +27,11 @@ _Avoid_: Link Ping, Reachability Check
 **Platform Page Search**:
 Discovery of an official watch page on a domestic video site when a title is absent from the catalog.
 _Avoid_: Site scrape, Web fallback, Direct resolution
+
+**Ordered Line Switch**:
+Sequential client-side switching through pre-ranked candidate streams delivered by the initial parse response upon playback stall or startup failure.
+_Avoid_: Dynamic Race, Background Benchmark, Multi-hop Retry
+
+**Channel Console**:
+The password-protected administrative interface allowing developers to inspect real-time playback logs, audit source health/culling ledgers, and dynamically add or remove parsing channels.
+_Avoid_: Dev Drawer, Admin Panel, Debug Popup

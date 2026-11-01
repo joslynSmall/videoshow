@@ -63,6 +63,13 @@ export function parseRemoteChannels(payload) {
       }
       entry.name = raw.name.trim();
     }
+    if (raw.type !== undefined) {
+      if (raw.type !== "browser" && raw.type !== "http-api") {
+        rejected.push({ id, reason: "type 必须是 browser 或 http-api" });
+        continue;
+      }
+      entry.type = raw.type;
+    }
     if (raw.parser !== undefined) {
       if (typeof raw.parser !== "string" || !Object.hasOwn(HTTP_PARSERS, raw.parser)) {
         rejected.push({ id, reason: "parser 未知" });
@@ -121,14 +128,24 @@ export function createChannelRegistry({
   const base = new Map(builtins.map((channel) => [channel.id, channel]));
   const remote = { fetchedAt: 0, nextAttemptAt: 0, ok: null, error: "", total: 0, rejected: [], entries: [] };
   let active = [...base.values()];
+  let browserChannels = [];
   let inflight = null;
 
   function rebuild() {
     const channels = new Map(base);
+    const browsers = [];
     const disabled = new Set();
     for (const entry of remote.entries) {
       if (!entry.enabled) {
         disabled.add(entry.id);
+        continue;
+      }
+      if (entry.type === "browser") {
+        browsers.push({
+          id: entry.id,
+          name: entry.name ?? entry.id,
+          endpoint: entry.endpoint,
+        });
         continue;
       }
       const builtin = base.get(entry.id);
@@ -151,12 +168,15 @@ export function createChannelRegistry({
     }
     for (const id of disabled) channels.delete(id);
     for (const channel of channels.values()) health?.setEndpoint(channel.id, channel.endpoint);
+    for (const browser of browsers) health?.setEndpoint(browser.id, browser.endpoint);
     for (const entry of remote.entries) {
-      if (entry.enabled && channels.has(entry.id)) {
-        health?.revive(entry.id, { endpoint: channels.get(entry.id).endpoint, revision: entry.revision ?? 0 });
+      if (entry.enabled && (channels.has(entry.id) || browsers.some((b) => b.id === entry.id))) {
+        const ep = channels.get(entry.id)?.endpoint || browsers.find((b) => b.id === entry.id)?.endpoint;
+        health?.revive(entry.id, { endpoint: ep, revision: entry.revision ?? 0 });
       }
     }
     active = [...channels.values()];
+    browserChannels = browsers;
     remote.disabled = disabled;
   }
 
@@ -195,7 +215,10 @@ export function createChannelRegistry({
     httpChannels() {
       return active.filter((channel) => !health?.isRemoved(channel.id));
     },
-    // jiexi789 / jx-browser 这类没有地址配置的内置渠道，只受健康账本约束。
+    browserChannels() {
+      return browserChannels.filter((b) => !health?.isRemoved(b.id) && !remote.disabled?.has(b.id));
+    },
+    // jiexi789 / jx-browser 这类内置渠道，以及外部配置的各种渠道，都受健康账本约束。
     isActive(id) {
       return !health?.isRemoved(id) && !remote.disabled?.has(id);
     },
@@ -211,15 +234,27 @@ export function createChannelRegistry({
     flush() {
       health?.flush();
     },
+    applyRemote(payload) {
+      const { accepted, rejected } = parseRemoteChannels(payload);
+      remote.entries = accepted;
+      remote.rejected = rejected;
+      remote.total = accepted.length;
+      remote.ok = true;
+      remote.error = "";
+      remote.fetchedAt = now();
+      rebuild();
+      return { accepted, rejected };
+    },
     status(extraIds = []) {
       const ids = [...new Set([
         ...active.map((channel) => channel.id),
+        ...browserChannels.map((b) => b.id),
         ...(remote.disabled ?? []),
         ...(health?.ids() ?? []),
         ...extraIds,
       ])];
       const channels = ids.map((id) => {
-        const channel = active.find((item) => item.id === id) ?? base.get(id);
+        const channel = active.find((item) => item.id === id) ?? browserChannels.find((b) => b.id === id) ?? base.get(id);
         const detail = health?.status(id);
         const disabled = Boolean(remote.disabled?.has(id));
         return {

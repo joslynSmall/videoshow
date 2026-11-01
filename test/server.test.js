@@ -1193,20 +1193,42 @@ test("local environment failures and cooldown skips are not counted against a ch
   assert.equal(health.status("jiexi789").today.successes, 0);
 });
 
-test("a channel disabled by the remote config is skipped", async (t) => {
-  const registry = createChannelRegistry({
-    builtins: [{ id: "lx", name: "LX解析", endpoint: "https://jx.example.com/?url=" }],
-    remoteUrl: "https://config.example.com/channels.json",
-    fetchFn: async () => Response.json({ channels: [{ id: "lx", enabled: false }, { id: "jx-browser", enabled: false }] }),
+test("POST /api/channels updates channels dynamically and triggers rebuild", async (t) => {
+  const { base } = await start(t);
+
+  const update = await getJson(`${base}/api/channels`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      channels: [
+        {
+          id: "custom-browser",
+          name: "自定义嗅探源",
+          type: "browser",
+          endpoint: "https://bfq.example.com/player?url=",
+        },
+        {
+          id: "custom-http",
+          name: "自定义HTTP",
+          type: "http-api",
+          endpoint: "https://http.example.com/?url=",
+        },
+      ],
+    }),
   });
-  await registry.refresh();
-  const calls = [];
-  const { base } = await start(t, {
-    channelRegistry: registry,
-    resolveBrowser: async () => { calls.push("jx-browser"); return fakeResult({ provider: "jx-browser" }); },
-    resolveHttp: async (channel) => { calls.push(channel.id); return null; },
-  });
-  const parse = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
-  assert.deepEqual(calls, []);
-  assert.deepEqual(parse.body.data.diagnostics.map((item) => item.provider), ["jiexi789"]);
+
+  assert.equal(update.response.status, 200);
+  assert.equal(update.body.ok, true);
+  assert.equal(update.body.data.accepted.length, 2);
+  assert.equal(update.body.data.rejected.length, 0);
+
+  const status = await getJson(`${base}/api/channels`);
+  const foundBrowser = status.body.data.channels.find((c) => c.id === "custom-browser");
+  const foundHttp = status.body.data.channels.find((c) => c.id === "custom-http");
+  assert.ok(foundBrowser, "动态添加的 browser 渠道应在 channels 列表中");
+  assert.equal(foundBrowser.name, "自定义嗅探源");
+  assert.equal(foundBrowser.state, "active");
+  assert.ok(foundHttp, "动态添加的 http-api 渠道应在 channels 列表中");
+  assert.equal(foundHttp.state, "active");
 });
+

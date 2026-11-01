@@ -346,6 +346,18 @@ export function createServer({
         run: () => resolveBrowser(sourceUrl, config.requestTimeoutMs),
       });
     }
+    if (config.enableBrowserProvider && resolveBrowser) {
+      for (const b of registry.browserChannels()) {
+        resolvers.push({
+          id: b.id,
+          kind: "browser",
+          run: () => resolveBrowser(sourceUrl, config.requestTimeoutMs, {
+            endpoint: b.endpoint,
+            provider: b.id,
+          }),
+        });
+      }
+    }
     for (const channel of registry.httpChannels()) {
       resolvers.push({
         id: channel.id,
@@ -940,6 +952,41 @@ export function createServer({
     });
   }
 
+  async function handleChannels(req, res) {
+    if (req.method === "GET") {
+      sendJson(res, 200, {
+        ok: true,
+        data: registry.status(["jiexi789", "jx-browser"]),
+      });
+      return;
+    }
+    if (req.method === "POST") {
+      const raw = await readRequestBody(req);
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        throw new AppError("BAD_REQUEST", 400, "无效的 JSON 请求体");
+      }
+      const result = registry.applyRemote(body);
+      registry.flush();
+      logger.info("channels.updated", {
+        accepted: result.accepted.length,
+        rejected: result.rejected.length,
+      });
+      sendJson(res, 200, {
+        ok: true,
+        data: {
+          accepted: result.accepted,
+          rejected: result.rejected,
+          status: registry.status(["jiexi789", "jx-browser"]),
+        },
+      });
+      return;
+    }
+    sendMethodNotAllowed(res, "GET, POST");
+  }
+
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
     res.on("finish", () => {
@@ -954,15 +1001,42 @@ export function createServer({
     try {
       const requestUrl = new URL(req.url || "/", "http://localhost");
 
-      if (requestUrl.pathname === "/api/channels") {
-        if (req.method !== "GET") {
-          sendMethodNotAllowed(res, "GET");
+      if (requestUrl.pathname === "/api/dev/auth") {
+        if (req.method !== "POST") {
+          sendMethodNotAllowed(res, "POST");
           return;
         }
+        const raw = await readRequestBody(req);
+        let body;
+        try { body = JSON.parse(raw); } catch { throw new AppError("BAD_REQUEST", 400, "无效的 JSON"); }
+        const password = typeof body?.password === "string" ? body.password.trim() : "";
+        if (password === (config.devPassword || "adminysdev")) {
+          sendJson(res, 200, { ok: true });
+        } else {
+          sendJson(res, 401, { ok: false, error: { code: "UNAUTHORIZED", message: "密码错误" } });
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/channels/sync") {
+        if (req.method !== "POST") {
+          sendMethodNotAllowed(res, "POST");
+          return;
+        }
+        const refreshed = await registry.refresh();
+        registry.flush();
         sendJson(res, 200, {
           ok: true,
-          data: registry.status(["jiexi789", "jx-browser"]),
+          data: {
+            refreshed,
+            status: registry.status(["jiexi789", "jx-browser"]),
+          },
         });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/channels") {
+        await handleChannels(req, res);
         return;
       }
 

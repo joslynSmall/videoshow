@@ -112,6 +112,14 @@
       </section>
     </main>
 
+    <!-- 全局加载中遮罩层 -->
+    <div id="loading-overlay" class="loading-overlay" hidden aria-live="assertive" role="alert">
+      <div class="loading-box">
+        <div class="loading-spinner" aria-hidden="true"></div>
+        <p id="loading-text" class="loading-text">正在解析中，请稍候…</p>
+      </div>
+    </div>
+
     <!-- 播放历史模态弹窗 -->
     <div id="history-modal" class="modal-backdrop" hidden>
       <div class="modal-pane">
@@ -162,16 +170,100 @@
     </footer>
   </div>
 
-  <details id="devlog" class="devlog">
-    <summary class="devlog-toggle" title="开发日志：渠道选择与切换">DEV <span id="devlog-count" hidden>0</span></summary>
-    <div class="devlog-panel">
-      <div class="devlog-head">
-        <span>渠道选择 / 切换日志</span>
-        <button id="devlog-clear" type="button">清空</button>
+  <!-- Channel Console 唤起浮动按钮 -->
+  <button id="dev-console-toggle" class="devlog-toggle-btn" type="button" aria-label="开发控制台" title="开发控制台与渠道维护">
+    DEV <span id="devlog-count" hidden>0</span>
+  </button>
+
+  <!-- Channel Console 模态弹窗 -->
+  <div id="dev-modal" class="modal-backdrop" hidden>
+    <div class="modal-pane modal-pane-wide dev-console-pane" role="dialog" aria-modal="true" aria-labelledby="dev-modal-title">
+      <div class="modal-header">
+        <h3 id="dev-modal-title">开发控制台 (Channel Console)</h3>
+        <button id="close-dev-modal" type="button" class="close-button" aria-label="关闭">&times;</button>
       </div>
-      <ol id="devlog-list" class="devlog-list" role="log" aria-live="polite"></ol>
+
+      <!-- 密码解锁门禁 -->
+      <div id="dev-auth-gate" class="dev-auth-gate">
+        <form id="dev-auth-form" class="dev-auth-box">
+          <label for="dev-password-input" class="dev-auth-label">请输入管理员访问密码</label>
+          <div class="dev-auth-row">
+            <input id="dev-password-input" type="password" placeholder="输入密码以解锁控制台..." autocomplete="current-password" required>
+            <button type="submit" class="ghost-button">解锁</button>
+          </div>
+          <p id="dev-auth-error" class="dev-auth-error" hidden>密码错误，请重新输入</p>
+        </form>
+      </div>
+
+      <!-- 解锁后主界面 -->
+      <div id="dev-console-body" class="dev-console-body" hidden>
+        <div class="dev-tabs">
+          <button id="dev-tab-playback" type="button" class="site-tab is-active">播放选源日志</button>
+          <button id="dev-tab-health" type="button" class="site-tab">源头更新与熔断日志</button>
+          <button id="dev-tab-manage" type="button" class="site-tab">渠道增删维护</button>
+        </div>
+
+        <!-- Tab 0: 播放选源与换线日志 -->
+        <div id="dev-panel-playback" class="dev-tab-panel">
+          <div class="dev-panel-head">
+            <span>实时选源、切源与异常追踪日志</span>
+            <button id="devlog-clear" type="button" class="ghost-button mini-button">清空日志</button>
+          </div>
+          <ol id="devlog-list" class="devlog-list" role="log" aria-live="polite"></ol>
+        </div>
+
+        <!-- Tab 1: 源头更新与清理日志 -->
+        <div id="dev-panel-health" class="dev-tab-panel" hidden>
+          <div class="dev-panel-head">
+            <span>自然日健康账本与熔断清理记录</span>
+            <div style="display:flex;gap:8px;">
+              <button id="dev-sync-remote" type="button" class="ghost-button mini-button" title="从远程配置源立即拉取最新渠道">手动同步源头</button>
+              <button id="dev-refresh-health" type="button" class="ghost-button mini-button">刷新状态</button>
+            </div>
+          </div>
+          <div id="dev-health-summary" class="dev-health-summary"></div>
+          <div id="dev-health-list" class="dev-health-list"></div>
+        </div>
+
+        <!-- Tab 2: 渠道维护管理 -->
+        <div id="dev-panel-manage" class="dev-tab-panel" hidden>
+          <form id="dev-channel-add-form" class="channel-add-card">
+            <h4 class="channel-card-heading">添加新解析渠道</h4>
+            <div class="channel-form-grid">
+              <div class="channel-field">
+                <label for="new-channel-id">渠道 ID</label>
+                <input id="new-channel-id" type="text" placeholder="例: my-browser" pattern="^[a-z0-9][a-z0-9_-]{0,31}$" required>
+              </div>
+              <div class="channel-field">
+                <label for="new-channel-name">渠道名称</label>
+                <input id="new-channel-name" type="text" placeholder="例: 备用嗅探源" required>
+              </div>
+              <div class="channel-field">
+                <label for="new-channel-type">类型</label>
+                <select id="new-channel-type">
+                  <option value="browser">browser (无头浏览器嗅探)</option>
+                  <option value="http-api">http-api (HTTP接口请求)</option>
+                </select>
+              </div>
+              <div class="channel-field channel-field-full">
+                <label for="new-channel-endpoint">Endpoint 目标地址 (以 = 结尾)</label>
+                <input id="new-channel-endpoint" type="url" placeholder="https://example.com/play?url=" required>
+              </div>
+            </div>
+            <div class="channel-form-foot">
+              <span id="channel-form-tip" class="channel-form-tip"></span>
+              <button type="submit" class="ghost-button">立即添加并生效</button>
+            </div>
+          </form>
+
+          <div class="channel-list-section">
+            <h4 class="channel-card-heading">当前全部渠道列表</h4>
+            <div id="dev-channel-items" class="dev-channel-items"></div>
+          </div>
+        </div>
+      </div>
     </div>
-  </details>
+  </div>
 
   <noscript>
     <p class="noscript">需要启用 JavaScript 才能解析和播放。</p>

@@ -1,11 +1,13 @@
 // 播放卡顿判定：纯状态机，不碰 DOM 和计时器，由调用方定时采样后传入 tick。
 //
 // 仅保留明确可靠的双重判定：
-//   1. 起播失败：新线路一直没有数据，超过 startupTimeoutMs；
+//   1. 起播失败：新线路连续 startupTimeoutMs 没有任何数据进展；有数据在下载（调用方传入递增的 sample.loaded）
+//      时放宽到 startupMaxMs，慢但健康的线路不会被误判；没有进展信号时等价于固定的 startupTimeoutMs；
 //   2. 播放硬卡死：播放中连续断流超过 hardStallMs。
 export const STALL_DEFAULTS = Object.freeze({
   tickMs: 500,
   startupTimeoutMs: 10_000,
+  startupMaxMs: 20_000,
   hardStallMs: 5_000,
   advanceEpsilon: 0.05,
   maxTickGapMs: 2_000,
@@ -22,6 +24,8 @@ export function createStallMonitor(overrides = {}) {
     state = {
       played: false,
       blockedSince: null,
+      progressAt: null,
+      lastLoaded: null,
       lastTime: null,
       lastTickAt: null,
       stallStartAt: null,
@@ -31,7 +35,10 @@ export function createStallMonitor(overrides = {}) {
 
   function startupTick(sample, now, dt, advanced, online) {
     if (!online) {
-      if (state.blockedSince !== null) state.blockedSince += dt;
+      if (state.blockedSince !== null) {
+        state.blockedSince += dt;
+        state.progressAt += dt;
+      }
       return NONE;
     }
     if (sample.seeking) {
@@ -48,10 +55,18 @@ export function createStallMonitor(overrides = {}) {
       state.blockedSince = null;
       return NONE;
     }
-    if (state.blockedSince === null) state.blockedSince = now;
+    if (state.blockedSince === null) {
+      state.blockedSince = now;
+      state.progressAt = now;
+      state.lastLoaded = null;
+    }
+    const loaded = Number.isFinite(sample.loaded) ? sample.loaded : null;
+    if (loaded !== null && state.lastLoaded !== null && loaded > state.lastLoaded) state.progressAt = now;
+    if (loaded !== null) state.lastLoaded = loaded;
     const blockedMs = now - state.blockedSince;
-    if (blockedMs >= cfg.startupTimeoutMs) {
-      return { action: "switch", reason: "startup", blockedMs };
+    const idleMs = now - state.progressAt;
+    if (idleMs >= cfg.startupTimeoutMs || blockedMs >= cfg.startupMaxMs) {
+      return { action: "switch", reason: "startup", blockedMs, idleMs };
     }
     return NONE;
   }

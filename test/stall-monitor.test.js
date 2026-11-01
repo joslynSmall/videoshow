@@ -129,3 +129,40 @@ test("reset returns to the startup phase for the new line", () => {
   assert.deepEqual(actions(h.run(h.seconds(9), { readyState: 0 })), []);
   assert.equal(firstSwitch(h.run(h.seconds(2), { readyState: 0 }))?.reason, "startup");
 });
+
+// 起播失败看的是“有没有数据进展”，不是“有没有起播”：慢但在下载的线路不该被误杀。
+test("startup: a line that keeps downloading survives past the idle window up to the hard ceiling", () => {
+  const h = harness();
+  let loaded = 0;
+  const decisions = [];
+  for (let i = 0; i < h.seconds(30); i += 1) {
+    decisions.push(...h.run(1, { readyState: 0, loaded: (loaded += 1) }));
+  }
+  const decision = firstSwitch(decisions);
+  assert.equal(decision?.reason, "startup");
+  assert.ok(decision.blockedMs >= STALL_DEFAULTS.startupMaxMs, "到了上限才判失败");
+  assert.ok(decision.blockedMs < STALL_DEFAULTS.startupMaxMs + 2 * TICK);
+  assert.equal(
+    decisions.indexOf(decision) < h.seconds(STALL_DEFAULTS.startupTimeoutMs / 1000 + 5),
+    false,
+    "有进展时不会在 10 秒空闲窗口处被判失败",
+  );
+});
+
+test("startup: downloading that stalls is judged by the idle window, not the ceiling", () => {
+  const h = harness();
+  let loaded = 0;
+  for (let i = 0; i < h.seconds(5); i += 1) h.run(1, { readyState: 0, loaded: (loaded += 1) });
+  assert.deepEqual(actions(h.run(h.seconds(9), { readyState: 0, loaded })), []);
+  const decision = firstSwitch(h.run(h.seconds(2), { readyState: 0, loaded }));
+  assert.equal(decision?.reason, "startup");
+  assert.ok(decision.idleMs >= STALL_DEFAULTS.startupTimeoutMs);
+});
+
+test("startup: without a progress signal the idle window equals the blocked time", () => {
+  const h = harness();
+  assert.deepEqual(actions(h.run(h.seconds(9), { readyState: 0 })), []);
+  const decision = firstSwitch(h.run(h.seconds(2), { readyState: 0 }));
+  assert.equal(decision?.reason, "startup");
+  assert.equal(decision.idleMs, decision.blockedMs);
+});

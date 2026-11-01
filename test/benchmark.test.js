@@ -259,3 +259,35 @@ test("raceAndSelect ranks a measured line above an unmeasured one and passes the
   );
   assert.ok(onlyUnmeasured.winner, "全部没测成时仍然要选出一条可用线路");
 });
+
+// 短时效线路的清单地址几秒就过期：调用方已经取到清单时，测速不能再请求第二次。
+test("benchmarkStream reuses a prefetched playlist instead of requesting it again", async (t) => {
+  const urls = [];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    urls.push(String(url));
+    return new Response(new Uint8Array(2048), { status: 206, headers: { "content-type": "video/mp2t" } });
+  });
+  const result = await benchmarkStream(
+    "https://8.8.8.8/path/index.m3u8?token=1",
+    "m3u8",
+    { playlist: "#EXTM3U\n#EXTINF:1,\nseg1.ts\n" },
+  );
+  assert.equal(result.available, true);
+  assert.deepEqual(urls, ["https://8.8.8.8/path/seg1.ts"]);
+});
+
+test("raceAndSelect hands each candidate's validated playlist to the benchmark", async (t) => {
+  const urls = [];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    urls.push(String(url));
+    return new Response(new Uint8Array(2048), { status: 206, headers: { "content-type": "video/mp2t" } });
+  });
+  const result = await raceAndSelect([{
+    provider: "snapshot-line",
+    playUrl: "https://8.8.8.8/p/index.m3u8",
+    type: "m3u8",
+    stream: { playlist: "#EXTM3U\n#EXTINF:1,\nfirst.ts\n" },
+  }], { probeSingle: true });
+  assert.equal(result.winner?.provider, "snapshot-line");
+  assert.deepEqual(urls, ["https://8.8.8.8/p/first.ts"]);
+});

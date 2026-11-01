@@ -10,7 +10,7 @@ export const HTTP_CHANNELS = Object.freeze([
   {
     id: "lx", name: "LX解析", endpoint: "https://jx.lxyy.club/index.php?url=",
     resolveResponse: resolveLxResponse,
-    singleUse: true,
+    shortLived: true,
   },
   {
     id: "jiexi789-page", name: "789解析", endpoint: "https://jiexi.789jiexi.com/?url=",
@@ -19,13 +19,13 @@ export const HTTP_CHANNELS = Object.freeze([
   {
     id: "bingdou", name: "冰豆解析", endpoint: "https://bd.jx.cn/?url=",
     resolveResponse: resolveBingdouResponse,
-    singleUse: true,
+    shortLived: true,
     fallback: true,
   },
   {
     id: "qilin", name: "麒麟解析", endpoint: "https://free.maccms.xyz/?url=",
     resolveResponse: resolvePlayerConfigResponse,
-    singleUse: true,
+    shortLived: true,
   },
 ]);
 
@@ -42,7 +42,7 @@ export const HTTP_PARSERS = Object.freeze({
 // 代码里的内置渠道，以及经过校验后由外部配置构造的渠道。
 const registeredChannels = new WeakSet(HTTP_CHANNELS);
 
-export function createHttpChannel({ id, name, endpoint, parser = "generic", singleUse = false, fallback = false }) {
+export function createHttpChannel({ id, name, endpoint, parser = "generic", shortLived = false, fallback = false }) {
   if (!Object.hasOwn(HTTP_PARSERS, parser)) throw new Error(`Unknown parser: ${parser}`);
   const channel = Object.freeze({
     id,
@@ -50,7 +50,7 @@ export function createHttpChannel({ id, name, endpoint, parser = "generic", sing
     endpoint,
     parser,
     ...(HTTP_PARSERS[parser] ? { resolveResponse: HTTP_PARSERS[parser] } : {}),
-    ...(singleUse ? { singleUse: true } : {}),
+    ...(shortLived ? { shortLived: true } : {}),
     ...(fallback ? { fallback: true } : {}),
   });
   registeredChannels.add(channel);
@@ -211,33 +211,14 @@ export async function resolveHttpChannel(channel, sourceUrl, options = {}) {
     : { playUrl: mediaUrl(response?.redirectUrl) || extractHttpPlayUrl(response?.text), type: "" };
   const playUrl = mediaUrl(result.playUrl);
   if (!playUrl) throw new AppError("PARSE_FAILED", 502, "解析渠道未返回媒体地址");
-  // 单次签名链接的本地有效期估计。
-// 实测：主线路 fragLoadTimeOut 可能要 40-50 秒才触发，而原来的 45 秒兼口刚卡在
-// 主线路死亡之前，导致备用线路在换线时已全部过期（expired=N，remaining=0）。
-// 这里把兼口拉到与解析缓存同量级，并保留“上游声明的 x-expires”优先。
-const SINGLE_USE_MIN_TTL_MS = 240_000;
-const SINGLE_USE_FALLBACK_TTL_MS = 300_000;
-
-function singleUseExpiry(playUrl) {
-  const expires = Number(new URL(playUrl).searchParams.get("x-expires"));
-  if (Number.isFinite(expires) && expires > 0) {
-    const expiresMs = expires > 1e12 ? expires : expires * 1000;
-    // 上游给出的期限优先，但至少保留 SINGLE_USE_MIN_TTL_MS，避免刚解析就过期。
-    return Math.max(Date.now() + SINGLE_USE_MIN_TTL_MS, expiresMs - 30_000);
-  }
-  // 没有 x-expires 时无法得知上游真实寿命，用一个足够覆盖“主线路崩溃+换线”的兼口。
-  return Date.now() + SINGLE_USE_FALLBACK_TTL_MS;
-}
-  const singleUse = channel.singleUse === true;
-  let expiresAtMs;
-  if (singleUse) expiresAtMs = singleUseExpiry(playUrl);
+  // 短时效线路的清单地址几秒内就会过期，没有可靠的过期时间可报；
+  // 服务端取回清单做成快照后，线路的有效期由解析会话决定。
   return {
     sourceUrl,
     playUrl,
     provider: channel.id,
     type: result.type,
-    singleUse,
-    ...(singleUse ? { expiresAtMs } : {}),
+    shortLived: channel.shortLived === true,
   };
 }
 

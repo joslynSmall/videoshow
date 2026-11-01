@@ -36,15 +36,13 @@ test("qilin obtains a fresh page value and calls only the fixed same-origin JSON
   assert.deepEqual(calls[1].options.headers, { referer: calls[0].url });
   assert.ok(calls[1].timeoutMs > 0 && calls[1].timeoutMs <= calls[0].timeoutMs);
   assert.ok(calls[0].timeoutMs <= 4000);
-  const { expiresAtMs, ...rest } = result;
-  assert.deepEqual(rest, {
+  assert.deepEqual(result, {
     sourceUrl: SOURCE,
     playUrl: MEDIA,
     provider: "qilin",
     type: "m3u8",
-    singleUse: true,
+    shortLived: true,
   });
-  assert.ok(expiresAtMs > Date.now());
   assert.ok(!inspect(result).includes(PAGE_TOKEN));
 });
 

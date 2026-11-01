@@ -19,10 +19,11 @@ import { loadPageEpisodes, searchSites } from "./sites/index.js";
 import { assertPublicMediaUrl, openMedia } from "./media.js";
 import { createChannelHealth } from "./channels/health.js";
 import { createChannelRegistry } from "./channels/registry.js";
-import { lookupPublicMediaDns } from "./media-network.js";
+import { createSessionStore, formatSseEvent, parseCursor } from "./parse-session.js";
+import { absolutizePlaylist, lineKey, segmentHosts } from "./playlist.js";
 import { extractExpiry, normalizeType, validateStream } from "./stream.js";
 
-const RECORDED_SUCCESS = new Set(["single-use", "benchmarked", "duplicate"]);
+const RECORDED_SUCCESS = new Set(["snapshot", "benchmarked", "unverified", "duplicate"]);
 const LOCAL_ENV_ERRORS = new Set(["BROWSER_UNAVAILABLE", "BROWSER_ERROR"]);
 
 const STATIC_FILES = new Map([
@@ -54,6 +55,22 @@ const STATIC_FILES = new Map([
     "/danmaku-text.js",
     {
       file: "danmaku-text.js",
+      type: "text/javascript; charset=utf-8",
+      cache: "no-cache",
+    },
+  ],
+  [
+    "/line-book.js",
+    {
+      file: "line-book.js",
+      type: "text/javascript; charset=utf-8",
+      cache: "no-cache",
+    },
+  ],
+  [
+    "/resolve-stream.js",
+    {
+      file: "resolve-stream.js",
       type: "text/javascript; charset=utf-8",
       cache: "no-cache",
     },
@@ -190,33 +207,6 @@ function sendError(res, err, logger) {
   sendJson(res, status, { ok: false, error: { code, message } });
 }
 
-// 等待主渠道：全部结束，或已有可用的已验证线路后再多等 graceMs
-// （让同样快的线路一起参与择优），其余渠道转后台继续，不再拖住响应。
-function waitForPrimary(tasks, graceMs, isGood) {
-  return new Promise((resolve) => {
-    let remaining = tasks.length;
-    let timer = null;
-    const done = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    if (!remaining) {
-      resolve();
-      return;
-    }
-    for (const task of tasks) {
-      task.then((result) => {
-        remaining -= 1;
-        if (remaining === 0) {
-          done();
-          return;
-        }
-        if (result && isGood(result) && timer === null) timer = setTimeout(done, graceMs);
-      });
-    }
-  });
-}
-
 async function sendStatic(req, res, entry, logger) {
   const filePath = path.join(config.publicDir, entry.file);
   let data;
@@ -269,32 +259,17 @@ export function createServer({
   now = Date.now,
   cacheTtlMs = config.cacheTtlMs,
   cacheMaxEntries = config.cacheMaxEntries,
-  parseGraceMs = config.parseGraceMs,
-  probeHost = (host, options) => lookupPublicMediaDns.probe(host, options),
+  refreshMinMs = config.parseRefreshMinMs,
+  heartbeatMs = config.streamHeartbeatMs,
   channelRegistry = null,
 } = {}) {
   const registry = channelRegistry ?? createChannelRegistry({
     builtins: httpChannels,
     builtinBrowsers: builtinBrowserChannels(),
   });
-  const parseCache = new Map();
+  const sessions = createSessionStore({ ttlMs: cacheTtlMs, maxSessions: cacheMaxEntries, now });
   const danmakuCache = new Map();
   const providerCooldowns = new Map();
-
-  async function hostHealth(playUrl) {
-    const host = hostOf(playUrl);
-    if (!host) return "unknown";
-    // 探测只发 DNS 查询，最多等 2 秒；拿不到结论就当作未知。共享的查询不会被某一个调用方打断。
-    let timer;
-    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve("unknown"), 2000); });
-    try {
-      return (await Promise.race([probeHost(host), timeout])) || "unknown";
-    } catch {
-      return "unknown";
-    } finally {
-      clearTimeout(timer);
-    }
-  }
 
   function getCached(cache, key) {
     const entry = cache.get(key);
@@ -324,28 +299,28 @@ export function createServer({
     return entry;
   }
 
-  async function handleParse(res, requestUrl) {
-    const sourceUrl = normalizeVideoUrl(requestUrl.searchParams.get("url"));
-    // force=1 用于换线后的重新解析：必须绕过缓存重新走解析，
-    // 否则拿回同一批已过期的单次链接，刷新签名地址的兜底逻辑会完全失效。
-    const force = requestUrl.searchParams.get("force") === "1";
-    const cached = force ? null : getCached(parseCache, sourceUrl);
-    if (cached) {
-      sendJson(res, 200, { ok: true, data: { ...cached.data, cached: true } });
-      return;
-    }
-
+  function buildResolvers(sourceUrl) {
     registry.ensureFresh();
-    // 被健康账本摘除或被外部配置停用的渠道不再参与解析。
+    // 被外部配置停用的渠道不再参与解析。被健康账本摘除的渠道平时也不参与，
+    // 只在到了试探时间时放回这一轮跑一次（probe），产出可用线路就自动复活。
     const resolvers = [];
-    if (registry.isActive("jiexi789")) {
+    // 内置渠道的在用判断：在用直接加入；被摘除则看是否轮到试探。
+    const admit = (id) => {
+      if (registry.isActive(id)) return { probe: false };
+      if (registry.isRemoved(id) && registry.claimProbe(id)) return { probe: true };
+      return null;
+    };
+    const jiexi = admit("jiexi789");
+    if (jiexi) {
       // kind 用于日志区分渠道实现方式，由服务端定义，前端不做硬编码推断。
-      resolvers.push({ id: "jiexi789", kind: "api", run: () => resolve(sourceUrl) });
+      resolvers.push({ id: "jiexi789", kind: "api", probe: jiexi.probe, run: () => resolve(sourceUrl) });
     }
-    if (config.enableBrowserProvider && resolveBrowser && registry.isActive("jx-browser")) {
+    const jxBrowser = config.enableBrowserProvider && resolveBrowser ? admit("jx-browser") : null;
+    if (jxBrowser) {
       resolvers.push({
         id: "jx-browser",
         kind: "browser",
+        probe: jxBrowser.probe,
         run: () => resolveBrowser(sourceUrl, config.requestTimeoutMs),
       });
     }
@@ -353,10 +328,15 @@ export function createServer({
       // 内置与外部配置的 browser 渠道统一调度；两者都带 endpoint，
       // jx-browser 走 jx.1ljx.com（产出 png.ruyijx.com），
       // 备用入口走 bfq.txnp.cn（产出 vv.iisfu.top），不同 CDN 可互为备份。
-      for (const b of registry.browserChannels()) {
+      const browsers = [
+        ...registry.browserChannels().map((b) => ({ b, probe: false })),
+        ...registry.removedBrowserChannels().filter((b) => registry.claimProbe(b.id)).map((b) => ({ b, probe: true })),
+      ];
+      for (const { b, probe } of browsers) {
         resolvers.push({
           id: b.id,
           kind: "browser",
+          probe,
           run: () => resolveBrowser(sourceUrl, config.requestTimeoutMs, {
             endpoint: b.endpoint,
             provider: b.id,
@@ -364,30 +344,122 @@ export function createServer({
         });
       }
     }
-    for (const channel of registry.httpChannels()) {
+    const httpEntries = [
+      ...registry.httpChannels().map((channel) => ({ channel, probe: false })),
+      ...registry.removedHttpChannels().filter((channel) => registry.claimProbe(channel.id)).map((channel) => ({ channel, probe: true })),
+    ];
+    for (const { channel, probe } of httpEntries) {
       resolvers.push({
         id: channel.id,
         kind: "http-api",
-        fallback: channel.fallback === true,
+        // 试探必须真的跑一次才有结论，不能被“已有可用线路”跳过，所以不走备用队列。
+        fallback: !probe && channel.fallback === true,
+        probe,
         run: () => resolveHttp(channel, sourceUrl, {
           timeoutMs: config.httpProviderTimeoutMs,
           resolveBrowserPage: resolveBingdou,
         }),
       });
     }
-    const seen = new Set();
-    const verified = [];
+    return resolvers;
+  }
+
+  // 标题和封面不阻塞起播：第一条线路出来后单独补发一个 meta 事件。
+  function emitMeta(session, candidate) {
+    return Promise.resolve()
+      .then(() => enrich(candidate.sourceUrl ?? session.sourceUrl, candidate.playUrl, candidate.stream))
+      .catch(() => null)
+      .then((info) => {
+        session.emit("meta", { title: info?.title ?? null, cover: info?.cover ?? null });
+      });
+  }
+
+  // 一轮解析：所有渠道并发，线路一通过校验和测速就作为 line 事件推给观众，不等其他渠道。
+  async function runRound(session) {
+    // running 必须在第一个 await 之前置位，调用方依赖它判断是否有一轮正在进行。
+    session.running = true;
+    session.rounds += 1;
+    session.lastRoundAt = now();
+    const round = session.rounds;
+    const sourceUrl = session.sourceUrl;
+    const startedAt = performance.now();
+    const linesBefore = session.lineCount;
     const diagnostics = [];
     let resolvedCount = 0;
-    const parseStartedAt = performance.now();
+    let validatedCount = 0;
+    let hasVerifiedLine = false;
+
+    const emitDiagnostic = (diagnostic) => {
+      diagnostics.push(diagnostic);
+      session.emit("diagnostic", { round, ...diagnostic });
+    };
+
+    const emitLine = (candidate, item, fields) => {
+      const localId = session.nextLineId();
+      // 线路编号带上会话编号：会话过期重建后，客户端手上的新旧线路不会重号。
+      const id = `${session.id}.${localId}`;
+      const host = hostOf(candidate.playUrl);
+      const snapshotText = fields.snapshotText ?? null;
+      let playUrl = candidate.playUrl;
+      if (snapshotText) {
+        session.setSnapshot(localId, snapshotText);
+        playUrl = `/api/snapshot?s=${encodeURIComponent(session.id)}&l=${encodeURIComponent(localId)}`;
+      }
+      const playlist = candidate.stream?.playlist;
+      const segmentHost = candidate.type === "m3u8" && typeof playlist === "string"
+        ? (segmentHosts(playlist, candidate.playUrl, 1)[0] ?? host)
+        : host;
+      const expiresAtMs = Number.isFinite(candidate.expiresAtMs)
+        ? candidate.expiresAtMs
+        : extractExpiry(candidate.playUrl);
+      const line = {
+        id,
+        provider: candidate.provider,
+        kind: item.kind,
+        type: candidate.type,
+        playUrl,
+        host,
+        segmentHost,
+        snapshot: Boolean(snapshotText),
+        shortLived: candidate.shortLived === true,
+        verified: fields.verified,
+        available: true,
+        ttfbMs: fields.ttfbMs ?? null,
+        speedKBps: fields.speedKBps ?? 0,
+        score: fields.score ?? 0,
+        ...(fields.unmeasured ? { unmeasured: true } : {}),
+        key: fields.key,
+        ...(Number.isFinite(expiresAtMs) ? { expiresAtMs } : {}),
+        round,
+      };
+      session.emit("line", line);
+      if (line.verified) hasVerifiedLine = true;
+      logger.info("resolve.line", {
+        pageHost: hostOf(sourceUrl),
+        provider: line.provider,
+        playHost: line.host,
+        segmentHost: line.segmentHost,
+        snapshot: line.snapshot,
+        verified: line.verified,
+        ttfbMs: line.ttfbMs,
+        score: line.score,
+        round,
+      });
+      if (!session.metaRequested) {
+        session.metaRequested = true;
+        session.metaPromise = emitMeta(session, candidate);
+      }
+      return line;
+    };
+
     const runOne = async (item) => {
-      const startedAt = performance.now();
+      const itemStartedAt = performance.now();
       const diagnostic = { provider: item.id, kind: item.kind };
       const finish = (status, extra = {}) => {
-        diagnostics.push({
+        emitDiagnostic({
           ...diagnostic,
           status,
-          ms: Math.round(performance.now() - startedAt),
+          ms: Math.round(performance.now() - itemStartedAt),
           ...extra,
         });
       };
@@ -396,6 +468,8 @@ export function createServer({
         return null;
       }
       let candidate;
+      let key = null;
+      let snapshotText = null;
       try {
         const result = await item.run();
         providerCooldowns.delete(item.id);
@@ -404,66 +478,36 @@ export function createServer({
           return null;
         }
         diagnostic.playHost = hostOf(result.playUrl);
-        if (seen.has(result.playUrl)) {
+        if (session.seenUrls.has(result.playUrl)) {
           finish("duplicate");
           return null;
         }
-        seen.add(result.playUrl);
+        session.seenUrls.add(result.playUrl);
         resolvedCount += 1;
         const type = normalizeType(result.type, result.playUrl);
-        if (result.singleUse) {
-          // 单次签名链接不能预先请求：任何一次 GET 都会消耗签名，
-          // 服务端校验过之后客户端再取就会 404（实测 png.ruyijx.com 首次 200、
-          // 校验后立即 404）。所以这里只查 DNS：域名不存在就不必等起播超时。
-          // 清单是否可读只能由客户端在真正播放时判断。
-          if ((await hostHealth(result.playUrl)) === "dead") {
-            finish("rejected", {
-              code: "HOST_UNREACHABLE",
-              message: "媒体域名已失效（公共 DNS 返回 NXDOMAIN）",
-              playHost: hostOf(result.playUrl),
-            });
-            logger.warn("stream.rejected", {
-              provider: item.id,
-              message: "媒体域名已失效",
-              detail: { host: hostOf(result.playUrl) },
-            });
-            return null;
-          }
+        if (result.shortLived && type !== "m3u8") {
+          // 没有清单可取（例如直接给出 mp4 的短时效链接）：无法做快照，服务端也不预读，
+          // 作为未经校验的线路交给浏览器首次读取。
           candidate = { ...result, type, stream: { playlist: null } };
-          verified.push(candidate);
-          finish("single-use", {
-            type: candidate.type,
-            available: true,
-            verified: false,
-            singleUse: true,
-            ttfbMs: null,
-            speedKBps: 0,
-          });
-          return {
-            candidate,
-            ranked: {
-              provider: candidate.provider,
-              kind: item.kind,
-              playUrl: candidate.playUrl,
-              type: candidate.type,
-              // 单次签名链接必须带上过期时间，前端日志和 /api/race 都依赖它。
-              ...(Number.isFinite(candidate.expiresAtMs)
-                ? { expiresAtMs: candidate.expiresAtMs }
-                : {}),
-              speedKBps: 0,
-              ttfbMs: null,
-              score: 0,
-              available: true,
-              selected: false,
-              verified: false,
-              singleUse: true,
-            },
-          };
+          finish("unverified", { type, available: true, verified: false });
+          return emitLine(candidate, item, { verified: false, key: candidate.playUrl });
         }
         await guardMedia(result.playUrl);
+        // 短时效线路的清单地址只有几秒有效期，这是它唯一可读的时机：读到的文本固化成快照。
         const stream = await validate(result.playUrl, type);
+        validatedCount += 1;
         candidate = { ...result, type, stream };
-        verified.push(candidate);
+        if (type === "m3u8" && typeof stream?.playlist === "string") {
+          key = lineKey(hostOf(result.playUrl), stream.playlist, result.playUrl);
+          if (result.shortLived) snapshotText = absolutizePlaylist(stream.playlist, result.playUrl);
+        }
+        if (key) {
+          if (session.seenKeys.has(key)) {
+            finish("duplicate");
+            return null;
+          }
+          session.seenKeys.add(key);
+        }
       } catch (err) {
         if (["UPSTREAM_ERROR", "UPSTREAM_TIMEOUT", "BROWSER_UNAVAILABLE", "BROWSER_ERROR"].includes(err?.code)) {
           providerCooldowns.set(item.id, now() + 30_000);
@@ -491,34 +535,19 @@ export function createServer({
           type: candidate.type,
           available: false,
           verified: true,
-          singleUse: false,
-          ttfbMs: null,
-          speedKBps: 0,
           message: rejectedMessage,
         });
         logger.warn("benchmark.rejected", { provider: candidate.provider, message: rejectedMessage });
-        return {
-          candidate,
-          ranked: {
-            provider: candidate.provider,
-            kind: item.kind,
-            playUrl: candidate.playUrl,
-            type: candidate.type,
-            speedKBps: 0,
-            ttfbMs: Infinity,
-            available: false,
-            selected: false,
-            score: 0,
-            verified: true,
-            singleUse: false,
-          },
-        };
+        // 指纹只代表“已经产出或正在测的内容”：这条没能产出线路，就释放它，
+        // 内容相同的后到线路还有机会重测（这次失败可能只是临时的）。
+        if (key) session.seenKeys.delete(key);
+        return null;
       }
-      finish("benchmarked", {
+      finish(snapshotText ? "snapshot" : "benchmarked", {
         type: candidate.type,
         available: single.available,
         verified: true,
-        singleUse: false,
+        shortLived: candidate.shortLived === true,
         ttfbMs: single.ttfbMs,
         speedKBps: single.speedKBps,
         score: single.score,
@@ -526,189 +555,178 @@ export function createServer({
           ? { unmeasured: true, message: `测速未完成，按未测速处理：${single.error}` }
           : {}),
       });
-      return {
-        candidate: raceResult.winner,
-        ranked: { ...single, provider: candidate.provider, kind: item.kind, verified: true, singleUse: false },
-      };
+      return emitLine(candidate, item, {
+        verified: true,
+        key: key ?? candidate.playUrl,
+        snapshotText,
+        ttfbMs: single.ttfbMs,
+        speedKBps: single.speedKBps,
+        score: single.score,
+        unmeasured: single.unmeasured === true,
+      });
     };
-    const settled = new Set();
-    // 渠道成败记入健康账本。成功 = 产出了可用线路（含未测速、单次链接、与其他渠道重复的地址）；
-    // 失败 = 无结果、被拒、域名失效、测速硬失败。冷却跳过和本机环境问题（没装 Chrome、
+
+    // 渠道成败记入健康账本。成功 = 产出了可用线路（含未测速、快照、与其他渠道重复的地址）；
+    // 失败 = 无结果、被拒、测速硬失败。冷却跳过和本机环境问题（没装 Chrome、
     // DevTools 起不来）不是渠道的责任，不计入。
     const recordOutcome = (item) => {
       const last = diagnostics.findLast((entry) => entry.provider === item.id);
       if (!last || last.status === "cooldown") return;
       if (last.status === "rejected" && LOCAL_ENV_ERRORS.has(last.code)) return;
-      registry.record(item.id, RECORDED_SUCCESS.has(last.status));
+      const ok = RECORDED_SUCCESS.has(last.status);
+      if (item.probe) registry.recordProbe(item.id, ok);
+      else registry.record(item.id, ok);
     };
     const runTracked = async (item) => {
       try {
-        const result = await runOne(item);
+        const line = await runOne(item);
         recordOutcome(item);
-        return result;
+        return line;
       } catch (err) {
         logger.warn("resolver.crashed", { provider: item.id, message: err?.message });
-        registry.record(item.id, false);
+        if (item.probe) registry.recordProbe(item.id, false);
+        else registry.record(item.id, false);
         return null;
-      } finally {
-        settled.add(item.id);
       }
     };
-    const runResolvers = async (list) => (await Promise.all(list.map(runTracked))).filter(Boolean);
 
-    const primary = resolvers.filter((item) => !item.fallback);
-    const fallback = resolvers.filter((item) => item.fallback);
-    const measured = [];
-    const lateResults = [];
-    let responded = false;
-    let lateSink = null;
-    const isGood = (result) => result.ranked.available && result.ranked.verified;
-    const primaryTasks = primary.map((item) => runTracked(item).then((result) => {
-      if (!result) return null;
-      if (!responded) measured.push(result);
-      else if (lateSink) lateSink(result);
-      else lateResults.push(result);
-      return result;
-    }));
-    await waitForPrimary(primaryTasks, parseGraceMs, isGood);
-    responded = true;
-    const pendingPrimary = primary.filter((item) => !settled.has(item.id));
-    const hasVerifiedAvailable = measured.some(isGood);
-    if (fallback.length) {
-      if (hasVerifiedAvailable) {
-        for (const item of fallback) {
-          diagnostics.push({
-            provider: item.id,
-            kind: item.kind,
-            status: "fallback-skipped",
-            ms: 0,
-            message: "已有可用已验证线路",
-          });
+    session.emit("round", { round });
+    try {
+      const resolvers = buildResolvers(sourceUrl);
+      const primary = resolvers.filter((item) => !item.fallback);
+      const fallback = resolvers.filter((item) => item.fallback);
+      await Promise.all(primary.map(runTracked));
+      if (fallback.length) {
+        if (hasVerifiedLine) {
+          for (const item of fallback) {
+            emitDiagnostic({
+              provider: item.id,
+              kind: item.kind,
+              status: "fallback-skipped",
+              ms: 0,
+              message: "已有可用已验证线路",
+            });
+          }
+        } else {
+          await Promise.all(fallback.map(runTracked));
         }
-      } else {
-        measured.push(...(await runResolvers(fallback)));
       }
-    }
-    if (!verified.length) {
-      throw new AppError(
-        resolvedCount ? "STREAM_INVALID" : "PARSE_FAILED",
-        502,
-        resolvedCount ? "所有解析线路均未返回可播放媒体" : "所有解析线路均未能解析该视频",
-      );
-    }
-    const available = measured.filter((item) => item.ranked.available);
-    if (!available.length) {
-      throw new AppError("STREAM_INVALID", 502, "播放线路测速均未通过");
-    }
-    measured.sort((a, b) =>
-      Number(b.ranked.available) - Number(a.ranked.available) ||
-      Number(b.ranked.verified) - Number(a.ranked.verified) ||
-      (b.ranked.score ?? 0) - (a.ranked.score ?? 0) ||
-      (a.ranked.ttfbMs ?? Infinity) - (b.ranked.ttfbMs ?? Infinity));
-    const winner = measured.find((item) => item.ranked.available);
-    const ranked = measured.map((item) => ({
-      ...item.ranked,
-      // expiresAtMs 必须随候选一起缓存：/api/race 的过期过滤读的就是这个字段，
-      // 之前只存在于 candidate 上，缓存里的 ranked 全部为 undefined，
-      // 导致 singleUse 候选要么被永久保留，要么被错误排除。
-      ...(Number.isFinite(item.candidate?.expiresAtMs)
-        ? { expiresAtMs: item.candidate.expiresAtMs }
-        : {}),
-      selected: item === winner && item.ranked.available,
-    }));
-    const selectedResult = winner.candidate;
-    const stream = selectedResult.stream;
-    const info =
-      (await enrich(selectedResult.sourceUrl, selectedResult.playUrl, stream)) ??
-      {};
-    const expiresAtMs = Number.isFinite(selectedResult.expiresAtMs)
-      ? selectedResult.expiresAtMs
-      : extractExpiry(selectedResult.playUrl);
-
-    // 仍在后台的渠道在响应里标记为 background，跑完后只补进缓存的备用线路，不再改写已发出的响应。
-    const responseDiagnostics = [
-      ...diagnostics,
-      ...pendingPrimary.map((item) => ({
-        provider: item.id,
-        kind: item.kind,
-        status: "background",
-        ms: Math.round(performance.now() - parseStartedAt),
-        message: "已有可用线路，仍在后台解析，完成后补入备用线路",
-      })),
-    ];
-
-    const data = {
-      sourceUrl: selectedResult.sourceUrl,
-      playUrl: selectedResult.playUrl,
-      type: selectedResult.type,
-      title: info.title ?? null,
-      cover: info.cover ?? null,
-      expiresAt: Number.isFinite(expiresAtMs)
-        ? new Date(expiresAtMs).toISOString()
-        : null,
-      provider: selectedResult.provider,
-      singleUse: selectedResult.singleUse === true,
-      verified: selectedResult.singleUse !== true,
-      candidates: ranked,
-      diagnostics: responseDiagnostics,
-      cached: false,
-      danmaku: {
-        provider: "dmku",
-        endpoint: `/api/danmaku?url=${encodeURIComponent(selectedResult.sourceUrl)}`,
-      },
-    };
-
-    const stored = storeCached(parseCache, sourceUrl, data, expiresAtMs,
-      measured.map((item) => {
-        const { stream: _stream, metric: _metric, ...candidate } = item.candidate;
-        return candidate;
-      }));
-    // 后台完成的渠道补进同一条缓存：换线（/api/race）时才能用上它们。
-    // 缓存条目已被强制重新解析替换或过期时丢弃，避免把旧结果混进新的候选。
-    const attachLate = (result) => {
-      const { stream: _stream, metric: _metric, ...candidate } = result.candidate;
-      if (!stored || parseCache.get(sourceUrl) !== stored) {
-        logger.info("parse.late_dropped", { provider: result.ranked.provider });
-        return;
-      }
-      stored.candidates.push(candidate);
-      stored.data.candidates.push({
-        ...result.ranked,
-        ...(Number.isFinite(candidate.expiresAtMs) ? { expiresAtMs: candidate.expiresAtMs } : {}),
-        selected: false,
-      });
-      logger.info("parse.late_candidate", {
+      // 标题补发完再收尾：事件流在 done 之后就关闭，晚到的 meta 会被截断。
+      await session.metaPromise;
+      const ms = Math.round(performance.now() - startedAt);
+      logger.info("resolve.round", {
         pageHost: hostOf(sourceUrl),
-        provider: result.ranked.provider,
-        playHost: hostOf(result.ranked.playUrl),
-        available: result.ranked.available,
-        verified: result.ranked.verified,
-      });
-    };
-    lateSink = attachLate;
-    for (const result of lateResults.splice(0)) attachLate(result);
-    logger.info("parse.selected", {
-      pageHost: hostOf(sourceUrl),
-      provider: data.provider,
-      type: data.type,
-      playHost: hostOf(data.playUrl),
-      candidates: (ranked || []).map((item) => ({
-        provider: item.provider,
-        playHost: hostOf(item.playUrl),
-        speedKBps: item.speedKBps,
-        ttfbMs: item.ttfbMs,
-        available: item.available,
-        selected: item.selected,
-        verified: item.verified,
-        singleUse: item.singleUse,
-      })),
-      diagnostics: responseDiagnostics.map(({ provider, status, ms }) => ({
-        provider,
-        status,
+        round,
+        newLines: session.lineCount - linesBefore,
+        lines: session.lineCount,
         ms,
-      })),
+      });
+      if (session.lineCount === 0) {
+        const [code, message] = validatedCount
+          ? ["STREAM_INVALID", "播放线路测速均未通过"]
+          : resolvedCount
+            ? ["STREAM_INVALID", "所有解析线路均未返回可播放媒体"]
+            : ["PARSE_FAILED", "所有解析线路均未能解析该视频"];
+        session.running = false;
+        session.emit("failed", { round, code, message });
+      } else {
+        session.running = false;
+        session.emit("done", { round, lines: session.lineCount, newLines: session.lineCount - linesBefore, ms });
+      }
+    } catch (err) {
+      logger.error("resolve.crashed", { pageHost: hostOf(sourceUrl), message: err?.message });
+      session.running = false;
+      session.emit("failed", { round, code: "INTERNAL", message: "服务内部错误" });
+    }
+  }
+
+  // 找到或新建这个页面的解析会话。线路全部用完的观众请求追加一轮（refresh），
+  // 会话里一条线路都没有时，后来的观众也会触发新一轮；两种情况都受最小间隔限制。
+  function acquireSession(sourceUrl, { refresh }) {
+    let session = sessions.get(sourceUrl);
+    if (!session) {
+      session = sessions.create(sourceUrl);
+      session.emit("session", {
+        sourceUrl,
+        pageHost: hostOf(sourceUrl),
+        danmaku: {
+          provider: "dmku",
+          endpoint: `/api/danmaku?url=${encodeURIComponent(sourceUrl)}`,
+        },
+      });
+      void runRound(session);
+      return session;
+    }
+    const wantsRound = refresh || session.lineCount === 0;
+    if (!session.running && wantsRound && now() - session.lastRoundAt >= refreshMinMs) {
+      void runRound(session);
+    }
+    return session;
+  }
+
+  async function handleResolve(req, res, requestUrl) {
+    const sourceUrl = normalizeVideoUrl(requestUrl.searchParams.get("url"));
+    const refresh = requestUrl.searchParams.get("refresh") === "1";
+    const session = acquireSession(sourceUrl, { refresh });
+    // EventSource 重连会自带 Last-Event-ID；客户端自己重连时用 after 参数。
+    const cursor = parseCursor(req.headers["last-event-id"] || requestUrl.searchParams.get("after"));
+    const afterSeq = cursor && cursor.sessionId === session.id ? cursor.seq : 0;
+
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store, no-transform",
+      // 提示 nginx 之类的反向代理不要缓冲，否则线路要等缓冲区写满才到客户端。
+      "x-accel-buffering": "no",
     });
-    sendJson(res, 200, { ok: true, data });
+    const write = (chunk) => {
+      if (!res.writableEnded && !res.destroyed) res.write(chunk);
+    };
+    write("retry: 2000\n\n");
+    for (const event of session.replay(afterSeq)) write(formatSseEvent(event));
+
+    const finish = () => {
+      if (res.writableEnded || res.destroyed) return;
+      // 明确的结束标记：客户端据此区分“解析已结束”和“连接中途断开需要重连”。
+      write(formatSseEvent({ type: "end", data: {} }));
+      res.end();
+    };
+    if (!session.running) {
+      finish();
+      return;
+    }
+    const heartbeat = setInterval(() => write(": ping\n\n"), heartbeatMs);
+    const unsubscribe = session.subscribe((event) => {
+      write(formatSseEvent(event));
+      if (event.type === "done" || event.type === "failed") {
+        cleanup();
+        finish();
+      }
+    });
+    function cleanup() {
+      clearInterval(heartbeat);
+      unsubscribe();
+    }
+    res.once("close", cleanup);
+  }
+
+  async function handleSnapshot(req, res, requestUrl) {
+    const sessionId = requestUrl.searchParams.get("s") || "";
+    const lineId = requestUrl.searchParams.get("l") || "";
+    const text = /^[A-Za-z0-9]{1,32}$/.test(sessionId) && /^L\d{1,6}$/.test(lineId)
+      ? sessions.getById(sessionId)?.snapshot(lineId)
+      : null;
+    if (typeof text !== "string") {
+      throw new AppError("SNAPSHOT_EXPIRED", 404, "线路快照已过期，请重新解析");
+    }
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+      "content-length": Buffer.byteLength(text),
+      "cache-control": "no-store",
+    });
+    if (req.method === "HEAD") res.end();
+    else res.end(text);
   }
 
   async function handleDanmaku(res, requestUrl) {
@@ -856,111 +874,6 @@ export function createServer({
     sendJson(res, 200, { ok: true, data });
   }
 
-  async function handleRace(req, res) {
-    if (req.method !== "POST") {
-      sendMethodNotAllowed(res, "POST");
-      return;
-    }
-    const raw = await readRequestBody(req);
-    let body;
-    try {
-      body = JSON.parse(raw);
-    } catch {
-      throw new AppError("BAD_REQUEST", 400, "无效的 JSON 请求体");
-    }
-    const sourceUrl = normalizeVideoUrl(body?.sourceUrl);
-    const entry = getCached(parseCache, sourceUrl);
-    if (!entry) {
-      throw new AppError("PARSE_EXPIRED", 409, "播放线路已过期，请重新解析");
-    }
-    const excluded = Array.isArray(body.failedPlayUrls) ? body.failedPlayUrls : [];
-    if (excluded.length > 20 || excluded.some((value) => typeof value !== "string")) {
-      throw new AppError("BAD_REQUEST", 400, "无效的失败线路列表");
-    }
-    // 域名级别的失败信息：avoidHosts 失败过 1 次，换线时让其他域名的候选优先；
-    // blockedHosts 已连续失败，直接排除。两者都来自客户端，只当作不可信的字符串列表使用。
-    const hostList = (value, label) => {
-      const list = Array.isArray(value) ? value : [];
-      if (list.length > 20 || list.some((item) => typeof item !== "string" || item.length > 255)) {
-        throw new AppError("BAD_REQUEST", 400, label);
-      }
-      return new Set(list.map((item) => item.toLowerCase()));
-    };
-    const avoidHosts = hostList(body.avoidHosts, "无效的待避开域名列表");
-    const blockedHosts = hostList(body.blockedHosts, "无效的已失败域名列表");
-    const hostBlocked = (item) => blockedHosts.has(hostOf(item.playUrl).toLowerCase());
-    const allCandidates = entry.candidates;
-    const filtered = {
-      total: allCandidates.length,
-      excluded: allCandidates.filter((item) => excluded.includes(item.playUrl)).length,
-      expired: allCandidates.filter((item) =>
-        Number.isFinite(item.expiresAtMs) && item.expiresAtMs <= now()).length,
-      hostBlocked: allCandidates.filter(hostBlocked).length,
-      remaining: 0,
-    };
-    const candidates = allCandidates.filter((item) =>
-      !excluded.includes(item.playUrl) &&
-      !hostBlocked(item) &&
-      (!Number.isFinite(item.expiresAtMs) || item.expiresAtMs > now()));
-    filtered.remaining = candidates.length;
-    if (!candidates.length) {
-      sendJson(res, 200, {
-        ok: true,
-        data: { selected: null, candidates: [], filtered },
-      });
-      return;
-    }
-    const verifiedCandidates = candidates.filter((item) => !item.singleUse);
-    const singleUseCandidates = candidates.filter((item) => item.singleUse);
-    let ranked = [];
-    if (verifiedCandidates.length) {
-      try {
-        const raceResult = await race(verifiedCandidates, {
-          probeSingle: true,
-          timeoutMs: config.benchmarkTimeoutMs,
-        });
-        ranked = raceResult?.ranked ?? [];
-        // race 的 ranked 由 benchmark 生成，不含 kind；回填缓存候选上的渠道类型。
-        ranked = ranked.map((item) => {
-          const source = verifiedCandidates.find((c) => c.provider === item.provider);
-          return { ...item, kind: source?.kind };
-        });
-      } catch (err) {
-        logger.warn("race.failed", { message: err?.message });
-      }
-    }
-    const singleUseRanked = singleUseCandidates.map((item) => ({
-      provider: item.provider,
-      kind: item.kind,
-      playUrl: item.playUrl,
-      type: item.type,
-      ...(Number.isFinite(item.expiresAtMs) ? { expiresAtMs: item.expiresAtMs } : {}),
-      speedKBps: 0,
-      ttfbMs: null,
-      score: 0,
-      available: true,
-      selected: false,
-      verified: false,
-      singleUse: true,
-    }));
-    // 选择顺序：未失败过域名的已验证线路 > 未失败过域名的单次链接 >
-    // 失败过域名的已验证线路 > 失败过域名的单次链接；同档内保持原有的测速排名。
-    const tierOf = (item) =>
-      (avoidHosts.has(hostOf(item.playUrl).toLowerCase()) ? 2 : 0) + (item.singleUse ? 1 : 0);
-    let picked = null;
-    for (const item of [...ranked.filter((c) => c.available !== false), ...singleUseRanked]) {
-      if (!picked || tierOf(item) < tierOf(picked)) picked = item;
-    }
-    const mark = (list) => list.map((item) => ({ ...item, selected: item === picked }));
-    const finalRanked = mark(ranked);
-    const finalSingleUse = mark(singleUseRanked);
-    const selected = [...finalRanked, ...finalSingleUse].find((item) => item.selected) ?? null;
-    sendJson(res, 200, {
-      ok: true,
-      data: { selected, candidates: [...finalRanked, ...finalSingleUse], filtered },
-    });
-  }
-
   function verifyDevPassword(req, body) {
     const headerPwd = typeof req.headers["x-dev-password"] === "string"
       ? req.headers["x-dev-password"].trim()
@@ -1085,12 +998,21 @@ export function createServer({
         return;
       }
 
-      if (requestUrl.pathname === "/api/parse") {
+      if (requestUrl.pathname === "/api/resolve") {
         if (req.method !== "GET") {
           sendMethodNotAllowed(res, "GET");
           return;
         }
-        await handleParse(res, requestUrl);
+        await handleResolve(req, res, requestUrl);
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/snapshot") {
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          sendMethodNotAllowed(res, "GET, HEAD");
+          return;
+        }
+        await handleSnapshot(req, res, requestUrl);
         return;
       }
 
@@ -1157,11 +1079,6 @@ export function createServer({
         return;
       }
 
-      if (requestUrl.pathname === "/api/race") {
-        await handleRace(req, res, requestUrl);
-        return;
-      }
-
       if (requestUrl.pathname.startsWith("/api/")) {
         sendJson(res, 404, {
           ok: false,
@@ -1217,6 +1134,7 @@ export function createProductionRegistry() {
     timeZone: config.channelTimezone,
     deadDays: config.channelDeadDays,
     minAttempts: config.channelMinDailyAttempts,
+    probeIntervalMs: config.channelProbeMinutes * 60_000,
     logger: log,
   });
   health.evaluate();

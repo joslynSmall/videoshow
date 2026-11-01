@@ -106,7 +106,7 @@ export function createPublicDnsResolver({
   };
 
   // 域名是否还存在：alive 有解析；dead 有端点明确返回 NXDOMAIN 且没有任何端点能解析；unknown 无法判断。
-  // 只发 DNS 查询，不会请求媒体地址，所以不会消耗单次签名链接。
+  // 只发 DNS 查询，不会请求媒体地址。
   // 同一个域名的并发探测共享一次查询：多个渠道指向同一个 CDN 域名时，必须得到一致的结论。
   const probing = new Map();
   resolver.probe = (hostname, options = {}) => {

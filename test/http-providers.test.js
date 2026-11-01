@@ -41,47 +41,15 @@ test("bingdou verifies the entry iframe and delegates to the browser resolver", 
   assert.equal(result.playUrl, MEDIA);
   assert.equal(result.provider, "bingdou");
   assert.equal(result.type, "mp4");
-  assert.equal(result.singleUse, true);
-  assert.ok(result.expiresAtMs > Date.now());
+  assert.equal(result.shortLived, true);
   assert.equal(browserCalls, 1);
 });
 
-test("single-use expiry honors x-expires when present", async () => {
+// 短时效线路的清单地址几秒就过期，解析层没有可靠的过期时间可报：
+// 不再按“单次签名”估一个几分钟的有效期，线路的有效期由服务端解析会话决定。
+test("short-lived links report no expiry of their own", async () => {
   const channel = HTTP_CHANNELS.find((item) => item.id === "bingdou");
   const expires = Math.floor(Date.now() / 1000) + 600;
-  const media = `https://cdn.example/video.mp4?x-expires=${expires}`;
-  const result = await resolveHttpChannel(channel, SOURCE, {
-    request: async () => ({
-      text: '<iframe src="https://jiexi.bot.cd/?url=demo"></iframe>',
-    }),
-    resolveBrowserPage: async () => ({ playUrl: media, type: "mp4" }),
-  });
-  assert.ok(result.expiresAtMs > Date.now() + 500_000);
-  assert.ok(result.expiresAtMs <= expires * 1000);
-});
-
-// 回归：主线路 fragLoadTimeOut 可能要 40-50 秒才触发，备用单次链接的本地寿命
-// 必须长于这个窗口，否则换线时全部候选已过期（曾用 45 秒兼口，必然来不及）。
-test("single-use links without x-expires survive a main-line stall", async () => {
-  const channel = HTTP_CHANNELS.find((item) => item.id === "bingdou");
-  const result = await resolveHttpChannel(channel, SOURCE, {
-    request: async () => ({
-      text: '<iframe src="https://jiexi.bot.cd/?url=demo"></iframe>',
-    }),
-    resolveBrowserPage: async () => ({ playUrl: "https://cdn.example/video.mp4", type: "mp4" }),
-  });
-  assert.ok(result.singleUse);
-  // 至少覆盖 4 分钟，保证晚于主线路崩溃时间。
-  assert.ok(
-    result.expiresAtMs >= Date.now() + 240_000,
-    `expected at least 240s of headroom, got ${Math.round((result.expiresAtMs - Date.now()) / 1000)}s`,
-  );
-});
-
-// 上游声明的 x-expires 很短时，也不能短到“刚解析就死”。
-test("single-use links clamp a too-short upstream expiry to a usable window", async () => {
-  const channel = HTTP_CHANNELS.find((item) => item.id === "bingdou");
-  const expires = Math.floor(Date.now() / 1000) + 20;
   const result = await resolveHttpChannel(channel, SOURCE, {
     request: async () => ({
       text: '<iframe src="https://jiexi.bot.cd/?url=demo"></iframe>',
@@ -91,10 +59,9 @@ test("single-use links clamp a too-short upstream expiry to a usable window", as
       type: "mp4",
     }),
   });
-  assert.ok(
-    result.expiresAtMs >= Date.now() + 240_000,
-    "a 20s upstream expiry must still be clamped up to the failover window",
-  );
+  assert.equal(result.shortLived, true);
+  assert.equal("expiresAtMs" in result, false);
+  assert.equal("singleUse" in result, false);
 });
 
 test("bingdou rejects untrusted iframe hosts before launching a browser", async () => {
@@ -140,8 +107,7 @@ test("LX follows public.php into the shared player config resolver", async () =>
   const result = await resolveHttpChannel(channel, SOURCE, { request });
   assert.equal(result.playUrl, MEDIA);
   assert.equal(result.provider, "lx");
-  assert.equal(result.singleUse, true);
-  assert.ok(result.expiresAtMs > Date.now());
+  assert.equal(result.shortLived, true);
   assert.equal(calls.length, 4);
   assert.equal(calls[1].url, "https://jx.lxyy.club/public.php");
   assert.equal(calls[1].options.method, "POST");

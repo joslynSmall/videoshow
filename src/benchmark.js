@@ -68,8 +68,11 @@ export async function benchmarkStream(playUrl, type, options = {}) {
     let targetProbeUrl = playUrl;
 
     if (type === "m3u8") {
+      // 调用方已经取到过这份清单时直接复用：短时效线路的清单地址几秒就过期，不能再取第二次。
+      let prefetched = typeof options.playlist === "string" ? options.playlist : null;
       for (let depth = 0; depth < 3; depth += 1) {
-        const playlist = await fetchPlaylist(targetProbeUrl, controller.signal);
+        const playlist = prefetched ?? await fetchPlaylist(targetProbeUrl, controller.signal);
+        prefetched = null;
         if (!playlist.trimStart().startsWith("#EXTM3U")) throw new Error("invalid playlist");
         const first = extractFirstSegmentUrl(playlist, targetProbeUrl);
         if (!first) throw new Error("empty playlist");
@@ -171,7 +174,10 @@ export async function raceAndSelect(candidates, options = {}) {
   const measure =
     typeof options.benchmark === "function"
       ? options.benchmark
-      : (candidate) => benchmarkStream(candidate.playUrl, candidate.type, options);
+      : (candidate) => benchmarkStream(candidate.playUrl, candidate.type, {
+          ...options,
+          playlist: candidate.stream?.playlist,
+        });
 
   const results = await Promise.allSettled(
     candidates.map(async (c) => {

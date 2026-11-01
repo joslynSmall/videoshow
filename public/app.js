@@ -1,5 +1,7 @@
 import { stripAdBlocks } from "/ad-filter.js";
 import { splitDanmakuText } from "/danmaku-text.js";
+import { createLineBook } from "/line-book.js";
+import { readResolveStream } from "/resolve-stream.js";
 import { createStallMonitor } from "/stall-monitor.js";
 
 window.renderArtDanmaku = function renderArtDanmaku(item) {
@@ -85,8 +87,16 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   let resumeWatchdog = null;
   // 换线中新线路出现致命错误时，用它让本次尝试立即失败并进入下一个候选，否则会一直等下去。
   let rejectSwitch = null;
-  // 新线路必须在这段时间内出数据（比起播判定的 10 秒略宽），否则视为本次换线失败。
-  const SWITCH_TIMEOUT_MS = 12000;
+  // 新线路连续这么久没有任何数据进展（清单、分片都没有动静）就视为本次换线失败；
+  // 有数据在下载时放宽到上限，慢但健康的线路不会被误杀。
+  const SWITCH_IDLE_MS = 12000;
+  const SWITCH_MAX_MS = 24000;
+  // 一直没有线路到达时，这么久之后提示用户仍在继续尝试（不终止解析）。
+  const SLOW_RESOLVE_HINT_MS = 30000;
+  // 换线时解析仍在进行，最多等这么久新线路。
+  const LATE_LINE_WAIT_MS = 30000;
+  // 当前解析会话：线路簿、事件流游标、标题等；换集或重新解析时关闭。
+  let activeSession = null;
 
   const devModal = document.querySelector("#dev-modal");
   const devConsoleToggle = document.querySelector("#dev-console-toggle");
@@ -190,24 +200,24 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     renderDevlog();
   }
 
-  function formatReason(candidate, fallbackRule = "") {
-    if (!candidate) return fallbackRule || "首选可用";
-    if (candidate.singleUse) return "单次签名链接（已通过可用性验证）";
-    if (typeof candidate.ttfbMs === "number" && Number.isFinite(candidate.ttfbMs)) {
-      return `测速耗时最快 (${Math.round(candidate.ttfbMs)}ms)`;
+  function formatReason(line) {
+    if (!line) return "首选可用";
+    const parts = [];
+    if (line.snapshot) parts.push("短时效线路，已取得清单快照");
+    if (line.verified === false) parts.push("服务端未校验");
+    if (typeof line.ttfbMs === "number" && Number.isFinite(line.ttfbMs)) {
+      parts.push(`首包 ${Math.round(line.ttfbMs)}ms`);
+    } else if (line.unmeasured) {
+      parts.push("测速未完成");
     }
-    return fallbackRule || "综合评分最高且可用";
+    return parts.length ? `最先到达的可用线路（${parts.join("，")}）` : "最先到达的可用线路";
   }
 
   function devlogSelection(data) {
-    const selected = (data.candidates || []).find((item) => item.selected) || {
-      provider: data.provider,
-      singleUse: data.singleUse,
-    };
-    const provider = selected.provider || data.provider || "未知";
-    const host = hostOf(data.playUrl);
-    const reason = formatReason(selected);
-    devlog("已选择线路", `【${provider}】(主机: ${host || "-"} | 原因: ${reason})`, "info");
+    const line = data.line;
+    const provider = line?.provider || data.provider || "未知";
+    const host = line?.host || hostOf(data.playUrl);
+    devlog("已选择线路", `【${provider}】(主机: ${host || "-"} | 原因: ${formatReason(line)})`, "info");
   }
 
   if (devlogClear) {
@@ -844,32 +854,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     }
   }
 
-  async function recoverDirectUrl(url) {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 4000);
-    try {
-      const response = await fetch(url, { cache: "no-store", signal: controller.signal });
-      const text = (await response.text()).replace(/^\uFEFF/, "").trim();
-      if (!text || text.startsWith("#EXTM3U")) return null;
-      let payload;
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        return null;
-      }
-      const next = payload?.url;
-      if (typeof next !== "string" || !/^https?:\/\//i.test(next)) return null;
-      return {
-        playUrl: next,
-        type: /\.m3u8(\?|$)/i.test(next) ? "m3u8" : "mp4",
-      };
-    } catch {
-      return null;
-    } finally {
-      window.clearTimeout(timer);
-    }
-  }
-
   // 出现误判时可在控制台执行 localStorage.setItem("videoshow.adFilter", "off") 关闭。
   function adFilterEnabled() {
     try {
@@ -897,208 +881,196 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     }
   }
 
+  // hls.js 的错误详情整理成换线记账用的证据，分级规则见 line-book.js 的 classifyFailure。
+  function hlsEvidence(detail) {
+    const text = String(detail?.details || "");
+    const timeout = /TimeOut/i.test(text);
+    const status = Number.isFinite(detail?.response?.code) ? detail.response.code : 0;
+    if (/manifestLoad|levelLoad|playlistLoad/i.test(text)) {
+      return { kind: "manifest", status, timeout };
+    }
+    if (/fragLoad/i.test(text)) {
+      return {
+        kind: "fragment",
+        status,
+        timeout,
+        host: hostOf(detail?.frag?.url || detail?.response?.url || detail?.url),
+      };
+    }
+    return { kind: "media" };
+  }
+
   function playM3u8(video, url, artInstance, onFatal, onAttached) {
-    const tried = new Set();
     const retry = { maxNumRetry: 2, retryDelayMs: 300, maxRetryDelayMs: 1000 };
     artInstance.activeHlsUrl = url;
     artInstance.hls?.destroy();
     artInstance.hls = null;
-    const startHls = (source) => {
-      if (artInstance.activeHlsUrl !== url) return;
-      onAttached?.();
-      if (!window.Hls?.isSupported()) {
-        if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          video.src = source;
-          return;
-        }
-        onFatal?.();
+    // 下载进展计数：看门狗据此区分“一直没有数据”和“慢但在下载”。
+    artInstance.loadCounter = 0;
+    artInstance.manifestLoaded = false;
+    onAttached?.();
+    if (!window.Hls?.isSupported()) {
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = url;
         return;
       }
+      onFatal?.("fatal", { kind: "media" });
+      return;
+    }
 
-      const BaseLoader = window.Hls.DefaultConfig?.loader;
-      const loader = BaseLoader
-        ? class MediaLoader extends BaseLoader {
-            constructor(config) {
-              super(config);
-              this.loaderOptions = config;
-              this.fallback = null;
-            }
+    const BaseLoader = window.Hls.DefaultConfig?.loader;
+    const loader = BaseLoader
+      ? class MediaLoader extends BaseLoader {
+          constructor(config) {
+            super(config);
+            this.loaderOptions = config;
+            this.fallback = null;
+          }
 
-            load(context, config, rawCallbacks) {
-              const original = context?.url;
-              // 播放列表在交给 hls.js 之前先去掉拼接广告；分片响应不是文本，原样放行。
-              const callbacks = adFilterEnabled()
-                ? {
-                    ...rawCallbacks,
-                    onSuccess: (response, ...rest) =>
-                      rawCallbacks.onSuccess?.(filterPlaylistResponse(response, original), ...rest),
-                  }
-                : rawCallbacks;
-              let crossOrigin = false;
-              try {
-                crossOrigin =
-                  typeof original === "string" &&
-                  /^https?:\/\//i.test(original) &&
-                  new URL(original).origin !== location.origin;
-              } catch {
-                crossOrigin = false;
-              }
-              if (!crossOrigin) {
-                super.load(context, config, callbacks);
-                return;
-              }
-
-              // 浏览器到源站通常是通的。先直连，超时或失败再交给本站中转。
-              let settled = false;
-              const useProxy = () => {
-                if (settled) return;
-                settled = true;
-                try {
-                  this.abortInternal();
-                } catch {
-                  // 直连已经结束时忽略。
+          load(context, config, rawCallbacks) {
+            const original = context?.url;
+            const progress = () => {
+              artInstance.loadCounter = (artInstance.loadCounter || 0) + 1;
+            };
+            const tracked = {
+              ...rawCallbacks,
+              onProgress: (...args) => {
+                progress();
+                rawCallbacks.onProgress?.(...args);
+              },
+              onSuccess: (...args) => {
+                progress();
+                rawCallbacks.onSuccess?.(...args);
+              },
+            };
+            // 播放列表在交给 hls.js 之前先去掉拼接广告；分片响应不是文本，原样放行。
+            const callbacks = adFilterEnabled()
+              ? {
+                  ...tracked,
+                  onSuccess: (response, ...rest) =>
+                    tracked.onSuccess?.(filterPlaylistResponse(response, original), ...rest),
                 }
-                context.url = `${location.origin}/api/media?url=${encodeURIComponent(original)}`;
-                const next = new BaseLoader(this.loaderOptions);
-                this.fallback = next;
-                next.load(context, config, callbacks);
-              };
-              const policy = config?.loadPolicy;
-              const directConfig = policy
-                ? {
-                    ...config,
-                    timeout: 4000,
-                    loadPolicy: {
-                      ...policy,
-                      maxTimeToFirstByteMs: 4000,
-                      maxLoadTimeMs: 8000,
-                      timeoutRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
-                      errorRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
-                    },
-                  }
-                : config;
-              super.load(context, directConfig, {
-                onSuccess: (...args) => {
-                  settled = true;
-                  callbacks.onSuccess?.(...args);
-                },
-                onProgress: (...args) => callbacks.onProgress?.(...args),
-                onError: () => useProxy(),
-                onTimeout: () => useProxy(),
-              });
+              : tracked;
+            let crossOrigin = false;
+            try {
+              crossOrigin =
+                typeof original === "string" &&
+                /^https?:\/\//i.test(original) &&
+                new URL(original).origin !== location.origin;
+            } catch {
+              crossOrigin = false;
             }
-
-            abort() {
-              this.fallback?.abort();
-              super.abort();
-            }
-
-            destroy() {
-              this.fallback?.destroy();
-              super.destroy();
-            }
-          }
-        : undefined;
-      // 播放列表是起播的前提：域名不通时尽快报错，交给换线逻辑，而不是等 hls.js 默认的长超时与重试。
-      const playlistPolicy = {
-        default: {
-          maxTimeToFirstByteMs: 6000,
-          maxLoadTimeMs: 10000,
-          timeoutRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
-          errorRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 1000 },
-        },
-      };
-      const hls = new window.Hls({
-        enableWorker: false,
-        manifestLoadPolicy: playlistPolicy,
-        playlistLoadPolicy: playlistPolicy,
-        ...(loader ? { loader } : {}),
-        fragLoadPolicy: {
-          default: {
-            maxTimeToFirstByteMs: 8000,
-            maxLoadTimeMs: 20000,
-            timeoutRetry: retry,
-            errorRetry: retry,
-          },
-        },
-      });
-      artInstance.hls = hls;
-      hls.loadSource(source);
-      hls.attachMedia(video);
-      hls.on(window.Hls.Events.ERROR, (_event, detail) => {
-        if (artInstance.hls !== hls || artInstance.activeHlsUrl !== url) return;
-        if (!detail?.fatal) {
-          if (detail?.type === "networkError") {
-            devlog("HLS 网络错误", {
-              details: detail.details,
-              host: hostOf(url),
-            }, "warn");
-          }
-          return;
-        }
-        devlog("HLS 致命错误", {
-          type: detail.type,
-          details: detail.details,
-          host: hostOf(url),
-        }, "error");
-        hls.destroy();
-        artInstance.hls = null;
-        // 播放列表（manifest/level）都取不到，说明这个域名连不上，换线时要整个域名排除。
-        const reason = /manifestLoad|levelLoad|playlistLoad/i.test(detail.details || "")
-          ? "unreachable"
-          : "fatal";
-        // 恢复直链是异步的：期间如果已经换到别的线路，这条线路迟到的错误必须丢弃，
-        // 否则会把新线路的换线尝试误判为失败。
-        const fail = () => {
-          if (artInstance.activeHlsUrl !== url) return;
-          onFatal?.(reason);
-        };
-        if (tried.has(source)) {
-          fail();
-          return;
-        }
-        tried.add(source);
-        recoverDirectUrl(source)
-          .then((recovered) => {
-            if (recovered && recovered.playUrl !== source) {
-              useRecovered(recovered);
+            if (!crossOrigin) {
+              super.load(context, config, callbacks);
               return;
             }
-            fail();
-          })
-          .catch(fail);
-      });
-    };
 
-    const useRecovered = (recovered) => {
-      if (artInstance.activeHlsUrl !== url) return;
-      devlog("HLS 自动恢复", {
-        fromHost: hostOf(url),
-        toHost: hostOf(recovered.playUrl),
-        provider: recovered.provider || "-",
-      }, "warn");
-      reportPlayback("playback.recover", {
-        fromHost: hostOf(url),
-        toHost: hostOf(recovered.playUrl),
-      });
-      setStatus("正在重新连接，请稍候…", "loading");
-      if (recovered.type === "mp4") {
-        onAttached?.();
-        video.src = recovered.playUrl;
+            // 浏览器到源站通常是通的。先直连，超时或失败再交给本站中转。
+            let settled = false;
+            const useProxy = () => {
+              if (settled) return;
+              settled = true;
+              try {
+                this.abortInternal();
+              } catch {
+                // 直连已经结束时忽略。
+              }
+              context.url = `${location.origin}/api/media?url=${encodeURIComponent(original)}`;
+              const next = new BaseLoader(this.loaderOptions);
+              this.fallback = next;
+              next.load(context, config, callbacks);
+            };
+            const policy = config?.loadPolicy;
+            const directConfig = policy
+              ? {
+                  ...config,
+                  timeout: 4000,
+                  loadPolicy: {
+                    ...policy,
+                    maxTimeToFirstByteMs: 4000,
+                    maxLoadTimeMs: 8000,
+                    timeoutRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
+                    errorRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
+                  },
+                }
+              : config;
+            super.load(context, directConfig, {
+              onSuccess: (...args) => {
+                settled = true;
+                callbacks.onSuccess?.(...args);
+              },
+              onProgress: (...args) => callbacks.onProgress?.(...args),
+              onError: () => useProxy(),
+              onTimeout: () => useProxy(),
+            });
+          }
+
+          abort() {
+            this.fallback?.abort();
+            super.abort();
+          }
+
+          destroy() {
+            this.fallback?.destroy();
+            super.destroy();
+          }
+        }
+      : undefined;
+    // 播放列表是起播的前提：域名不通时尽快报错，交给换线逻辑，而不是等 hls.js 默认的长超时与重试。
+    const playlistPolicy = {
+      default: {
+        maxTimeToFirstByteMs: 6000,
+        maxLoadTimeMs: 10000,
+        timeoutRetry: { maxNumRetry: 0, retryDelayMs: 0, maxRetryDelayMs: 0 },
+        errorRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 1000 },
+      },
+    };
+    const hls = new window.Hls({
+      enableWorker: false,
+      manifestLoadPolicy: playlistPolicy,
+      playlistLoadPolicy: playlistPolicy,
+      ...(loader ? { loader } : {}),
+      fragLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 8000,
+          maxLoadTimeMs: 20000,
+          timeoutRetry: retry,
+          errorRetry: retry,
+        },
+      },
+    });
+    artInstance.hls = hls;
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+      artInstance.manifestLoaded = true;
+    });
+    hls.on(window.Hls.Events.ERROR, (_event, detail) => {
+      if (artInstance.hls !== hls || artInstance.activeHlsUrl !== url) return;
+      if (!detail?.fatal) {
+        if (detail?.type === "networkError") {
+          devlog("HLS 网络错误", {
+            details: detail.details,
+            status: detail.response?.code ?? 0,
+            host: playHostOf(url),
+          }, "warn");
+        }
         return;
       }
-      startHls(recovered.playUrl);
-    };
-
-    recoverDirectUrl(url)
-      .then((recovered) => {
-        if (recovered && recovered.playUrl !== url) {
-          useRecovered(recovered);
-          return;
-        }
-        startHls(url);
-      })
-      .catch(() => startHls(url));
+      const evidence = hlsEvidence(detail);
+      devlog("HLS 致命错误", {
+        type: detail.type,
+        details: detail.details,
+        status: evidence.status ?? 0,
+        host: playHostOf(url),
+        ...(evidence.host ? { segmentHost: evidence.host } : {}),
+      }, "error");
+      hls.destroy();
+      artInstance.hls = null;
+      // 播放列表（manifest/level）都取不到记为 unreachable，其余记为 fatal；
+      // 具体该排除这条线路还是整个域名，由 evidence 决定。
+      onFatal?.(evidence.kind === "manifest" ? "unreachable" : "fatal", evidence);
+    });
   }
 
   async function loadDanmaku(endpoint) {
@@ -1123,89 +1095,300 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return title.replace(/(\s+第\d+集|\s+全集|\s+正片)+/gi, "").trim() || title;
   }
 
-  // 起播失败和播放列表取不到说明域名连不上（计 2 次，直接排除）；卡顿之类只计 1 次。
-  function failureWeight(reason) {
-    return reason === "startup" || reason === "unreachable" ? 2 : 1;
+  /* =========================================================================
+     解析会话：读取 /api/resolve 事件流，线路陆续到达线路簿，第一条到达即可起播
+     ========================================================================= */
+  // 快照线路的 playUrl 是本站路径，播放器需要绝对地址；日志里要显示的是线路原始域名。
+  const lineHosts = new Map();
+
+  function playHostOf(url) {
+    return lineHosts.get(url) || hostOf(url);
   }
 
-  async function switchToSmootherSource(data, reason = "") {
+  function normalizeLine(raw) {
+    const playUrl = typeof raw.playUrl === "string" && raw.playUrl.startsWith("/")
+      ? `${location.origin}${raw.playUrl}`
+      : raw.playUrl;
+    const line = { ...raw, playUrl };
+    if (line.host) lineHosts.set(playUrl, line.host);
+    return line;
+  }
+
+  function closeSession() {
+    if (!activeSession) return;
+    activeSession.closed = true;
+    activeSession.controller.abort();
+    activeSession.refreshController?.abort();
+    activeSession = null;
+  }
+
+  function buildSessionData(session, line) {
+    return {
+      sourceUrl: session.url,
+      playUrl: line.playUrl,
+      type: line.type,
+      provider: line.provider,
+      line,
+      session,
+      title: session.meta?.title ?? null,
+      cover: session.meta?.cover ?? null,
+      expiresAt: Number.isFinite(line.expiresAtMs) ? new Date(line.expiresAtMs).toISOString() : null,
+      danmaku: session.danmaku,
+    };
+  }
+
+  // 一次事件的处理，初次解析和追加一轮共用。
+  function handleSessionEvent(session, event) {
+    session.cursor = event.id || session.cursor;
+    const data = event.data || {};
+    switch (event.type) {
+      case "session":
+        session.danmaku = data.danmaku || null;
+        break;
+      case "line": {
+        const line = normalizeLine(data);
+        if (!session.book.add(line)) break;
+        devlog("收到线路", {
+          provider: line.provider,
+          host: line.host,
+          segmentHost: line.segmentHost,
+          snapshot: line.snapshot ? "yes" : "no",
+          verified: line.verified ? "yes" : "no",
+          ttfbMs: Number.isFinite(line.ttfbMs) ? Math.round(line.ttfbMs) : "-",
+          round: line.round,
+        }, "info");
+        session.onLine?.(line);
+        break;
+      }
+      case "meta":
+        session.meta = data;
+        session.onMeta?.(data);
+        break;
+      case "diagnostic":
+        devlog("渠道诊断", {
+          provider: data.provider,
+          status: data.status,
+          ms: data.ms,
+          ...(data.playHost ? { host: data.playHost } : {}),
+          ...(data.code ? { code: data.code } : {}),
+          ...(data.message ? { message: data.message } : {}),
+        }, data.status === "rejected" || data.status === "benchmark-rejected" ? "warn" : "info");
+        break;
+      case "round":
+        devlog("解析轮次", { round: data.round }, "info");
+        break;
+      case "done":
+        devlog("解析完成", { round: data.round, lines: data.lines, newLines: data.newLines, ms: data.ms }, "info");
+        break;
+      case "failed":
+        session.failure = data;
+        devlog("解析失败", { code: data.code, message: data.message }, "error");
+        break;
+      default:
+        break;
+    }
+  }
+
+  // 打开解析会话。第一条线路到达就返回可起播的 data，事件流继续在后台接收其余线路；
+  // 全部渠道都失败才抛出错误。onSlow 在长时间没有线路时调用，只提示，不终止解析。
+  function openSession(url, { onSlow } = {}) {
+    closeSession();
+    const controller = new AbortController();
+    const session = {
+      url,
+      controller,
+      book: createLineBook(),
+      cursor: "",
+      ended: false,
+      failure: null,
+      meta: null,
+      danmaku: null,
+      refreshing: null,
+      refreshController: null,
+      waiters: new Set(),
+      onLine: null,
+      onMeta: null,
+      closed: false,
+    };
+    activeSession = session;
+    devlog("解析请求", { host: hostOf(url) }, "info");
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const slowTimer = window.setTimeout(() => {
+        if (settled || session.closed) return;
+        devlog("解析较慢", "30 秒内没有可用线路，继续等待…", "warn");
+        onSlow?.();
+      }, SLOW_RESOLVE_HINT_MS);
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(slowTimer);
+        fn(value);
+      };
+      session.onLine = (line) => {
+        for (const wake of [...session.waiters]) wake();
+        if (!settled) settle(resolve, buildSessionData(session, line));
+      };
+      readResolveStream({
+        url,
+        signal: controller.signal,
+        onEvent: (event) => handleSessionEvent(session, event),
+      })
+        .then((outcome) => {
+          session.ended = true;
+          for (const wake of [...session.waiters]) wake();
+          // 被新的解析取代（换集、重新提交）：调用方的加载状态已经由新请求接管，
+          // 这个旧请求既不成功也不报错，保持挂起即可。
+          if (outcome?.aborted) return;
+          settle(reject, new Error(session.failure?.message || "解析失败，请稍后重试。"));
+        })
+        .catch((err) => {
+          session.ended = true;
+          for (const wake of [...session.waiters]) wake();
+          devlog("解析连接中断", err instanceof Error ? err.message : String(err), "error");
+          settle(reject, err instanceof Error ? err : new Error("解析失败，请稍后重试。"));
+        });
+    });
+  }
+
+  function resolveLines(url) {
+    return openSession(url, {
+      onSlow: () => {
+        if (loadingText) loadingText.textContent = "暂未找到可用线路，仍在继续尝试，请稍候…";
+      },
+    });
+  }
+
+  // 等待会话里出现新线路或解析结束，最多等 timeoutMs。
+  function waitForSessionActivity(session, timeoutMs) {
+    return new Promise((resolve) => {
+      let timer = 0;
+      const wake = () => {
+        window.clearTimeout(timer);
+        session.waiters.delete(wake);
+        resolve();
+      };
+      timer = window.setTimeout(wake, timeoutMs);
+      session.waiters.add(wake);
+    });
+  }
+
+  // 在原会话上追加一轮解析：服务端对同一页面的追加有最小间隔，被限流时不会产出新线路。
+  function refreshSession(session) {
+    if (session.refreshing) return session.refreshing;
+    const controller = new AbortController();
+    session.refreshController = controller;
+    session.ended = false;
+    session.failure = null;
+    session.refreshing = readResolveStream({
+      url: session.url,
+      refresh: true,
+      after: session.cursor,
+      signal: controller.signal,
+      onEvent: (event) => {
+        handleSessionEvent(session, event);
+        if (event.type === "line") for (const wake of [...session.waiters]) wake();
+      },
+    })
+      .catch((err) => {
+        devlog("追加解析失败", err instanceof Error ? err.message : String(err), "error");
+      })
+      .finally(() => {
+        session.ended = true;
+        session.refreshing = null;
+        session.refreshController = null;
+        for (const wake of [...session.waiters]) wake();
+      });
+    return session.refreshing;
+  }
+
+  // 选出下一条线路：线路簿里没有可用的但解析仍在进行时，先等后到的线路；
+  // 仍然没有，再在原会话上追加一轮（每次换线最多一轮）。
+  async function pickNextLine(session, state) {
+    let chosen = session.book.next();
+    if (!chosen && !session.ended) {
+      devlog("等待后台线路", "解析仍在进行，等待新线路…", "warn");
+      await waitForSessionActivity(session, LATE_LINE_WAIT_MS);
+      chosen = session.book.next();
+    }
+    if (!chosen && !state.refreshed && !session.closed) {
+      state.refreshed = true;
+      devlog("候选已耗尽", "请求在原解析会话上追加一轮…", "warn");
+      await refreshSession(session);
+      chosen = session.book.next();
+    }
+    return chosen;
+  }
+
+  // 新线路要出数据才算换线成功：连续 SWITCH_IDLE_MS 没有下载进展，或总计超过 SWITCH_MAX_MS 就判失败。
+  function watchSwitchProgress(instance) {
+    let poll = 0;
+    const promise = new Promise((_, reject) => {
+      const startedAt = Date.now();
+      let last = instance.loadCounter || 0;
+      let idleSince = startedAt;
+      poll = window.setInterval(() => {
+        const current = instance.loadCounter || 0;
+        const now = Date.now();
+        if (current !== last) {
+          last = current;
+          idleSince = now;
+        }
+        if (now - idleSince >= SWITCH_IDLE_MS || now - startedAt >= SWITCH_MAX_MS) {
+          reject(Object.assign(
+            new Error(`新线路 ${Math.round((now - idleSince) / 1000)} 秒内没有加载出数据`),
+            { evidence: { kind: "startup", manifestLoaded: instance.manifestLoaded === true } },
+          ));
+        }
+      }, 500);
+    });
+    return { promise, stop: () => window.clearInterval(poll) };
+  }
+
+  async function switchToSmootherSource(data, reason = "", evidence = null) {
     if (switchingLine || !art) {
       devlog("换线跳过", switchingLine ? "已有换线进行中" : "播放器不存在", "warn");
       return;
     }
     const instance = art;
+    const session = data.session;
     const continueAt = Number.isFinite(instance.currentTime) ? instance.currentTime : 0;
-    const failed = new Set(Array.isArray(data.failedPlayUrls) ? data.failedPlayUrls : []);
-    let hasRefreshed = false;
-    // 按域名累计失败次数：失败 1 次后换线优先选其他域名，失败 2 次就不再尝试该域名，
-    // 避免在同一个已失效的域名（例如多个解析渠道共用同一个 CDN）上反复浪费时间。
-    const hostFails = new Map(Object.entries(data.failedHostCounts || {}));
-    const bumpHost = (url, weight = 1) => {
-      const host = hostOf(url);
-      if (host) hostFails.set(host, (hostFails.get(host) || 0) + weight);
-    };
-    if (data.playUrl) {
-      failed.add(data.playUrl);
-      bumpHost(data.playUrl, failureWeight(reason));
+    if (!session?.book) {
+      setStatus("暂时播不了，请稍后再试。", "error");
+      return;
     }
+    // 失败只按证据的范围记账：线路级问题只排除这一条，域名级问题才累计到域名。
+    const defaultKind = reason === "startup" ? "startup" : reason === "hard" ? "stall" : "media";
+    const charged = session.book.fail(data.line, {
+      ...(evidence || { kind: defaultKind }),
+      manifestLoaded: instance.manifestLoaded === true,
+    });
     switchingLine = true;
     clearStallTimer();
     setStatus("播放不够流畅，正在更换线路…", "loading");
     devlog("触发换线", {
       reason: reason || "-",
       from: data.provider || "-",
-      fromHost: hostOf(data.playUrl),
+      fromHost: data.line?.host || hostOf(data.playUrl),
       continueAt: Math.round(continueAt),
-      failed: failed.size,
+      evidence: evidence?.kind || defaultKind,
+      ...(charged.length ? { hostStrikes: charged.map((item) => `${item.host}+${item.weight}`).join(",") } : {}),
     }, "warn");
-    // 选择下一个可用线路：优先使用已按质量/TTFB排好序的本地 candidates 列表
-    function selectNextCandidate() {
-      const candidates = Array.isArray(data.candidates) ? data.candidates : [];
-      const nowMs = Date.now();
-      for (const item of candidates) {
-        if (!item?.playUrl) continue;
-        if (failed.has(item.playUrl)) continue;
-        // 单次签名已明确过期的跳过
-        if (Number.isFinite(item.expiresAtMs) && item.expiresAtMs <= nowMs) continue;
-        // 该域名已判定不可达就直接排除：多个解析渠道常共用同一个 CDN
-        // （如 qilin 与 lx 都指向 png.ruyijx.com），该 CDN 一旦整体失效，
-        // 换到同域名的另一条线路只是重复踩同一个坑。
-        const h = hostOf(item.playUrl);
-        if (h && (hostFails.get(h) || 0) >= 2) continue;
-        return item;
-      }
-      return null;
-    }
 
+    const state = { refreshed: false };
     try {
       while (true) {
-        let chosen = selectNextCandidate();
-
-        // 本地候选已耗尽，如果尚未尝试过重新解析，则 force=1 刷新一轮
-        if (!chosen && !hasRefreshed) {
-          devlog("候选已耗尽", "请求后端重新解析以刷新签名及候选列表…", "warn");
-          try {
-            hasRefreshed = true;
-            const fresh = await parse(data.sourceUrl, { force: true });
-            if (art !== instance) return;
-            if (Array.isArray(fresh?.candidates)) {
-              data.candidates = fresh.candidates;
-              chosen = selectNextCandidate();
-            }
-          } catch (err) {
-            devlog("重新解析失败", err instanceof Error ? err.message : String(err), "error");
-          }
-        }
+        const chosen = await pickNextLine(session, state);
+        if (art !== instance) return;
 
         if (!chosen?.playUrl) {
           devlog("切源结束", "所有可用备选线路均已尝试完毕", "warn");
           break;
         }
 
-        failed.add(chosen.playUrl);
         const fromProvider = data.provider || "未知";
         const toProvider = chosen.provider || "未知";
-        const toHost = hostOf(chosen.playUrl);
+        const toHost = chosen.host || hostOf(chosen.playUrl);
         const switchReasonText =
           reason === "startup" ? "原源起播超时" :
           reason === "hard" ? "原源播放连续断流(>5s)" :
@@ -1213,34 +1396,22 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
         devlog("切换线路", `【${fromProvider} -> ${toProvider}】(新主机: ${toHost || "-"} | 原因: ${switchReasonText})`, "warn");
 
+        let watcher = null;
         try {
           instance.activeHlsUrl = null;
           instance.hls?.destroy();
           instance.hls = null;
           instance.type = chosen.type;
-          let timer = 0;
-          try {
-            await Promise.race([
-              instance.switchQuality(chosen.playUrl),
-              new Promise((_, reject) => { rejectSwitch = reject; }),
-              new Promise((_, reject) => {
-                timer = window.setTimeout(
-                  () => reject(Object.assign(
-                    new Error(`新线路 ${SWITCH_TIMEOUT_MS / 1000} 秒内没有加载出数据`),
-                    { weight: 2 },
-                  )),
-                  SWITCH_TIMEOUT_MS,
-                );
-              }),
-            ]);
-          } finally {
-            window.clearTimeout(timer);
-            rejectSwitch = null;
-          }
+          watcher = watchSwitchProgress(instance);
+          await Promise.race([
+            instance.switchQuality(chosen.playUrl),
+            new Promise((_, reject) => { rejectSwitch = reject; }),
+            watcher.promise,
+          ]);
           if (art !== instance) return;
           reportPlayback("playback.switch", {
-            fromHost: hostOf(data.playUrl),
-            toHost: toHost,
+            fromHost: data.line?.host || hostOf(data.playUrl),
+            toHost,
             episode: data.episodeName || "",
             continueAt,
           });
@@ -1248,10 +1419,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           data.playUrl = chosen.playUrl;
           data.type = chosen.type;
           data.provider = chosen.provider;
-          data.failedPlayUrls = [...failed].filter((url) => url !== chosen.playUrl);
-          // 换线成功也会提前 return，域名失败计数必须在这里落盘，
-          // 否则下一轮换线拿不到已排除的域名，会重复踩同一个失效 CDN。
-          data.failedHostCounts = Object.fromEntries(hostFails);
+          data.line = chosen;
           if (currentMedia) {
             currentMedia.playUrl = chosen.playUrl;
             currentMedia.type = chosen.type;
@@ -1261,20 +1429,31 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           resumeWatchdog?.();
           return;
         } catch (err) {
-          bumpHost(chosen.playUrl, err?.weight || 1);
-          devlog("换线失败", `【${toProvider}】加载失败: ${err instanceof Error ? err.message : String(err)}`, "error");
+          const failure = err?.evidence || { kind: "startup", manifestLoaded: instance.manifestLoaded === true };
+          const failureCharged = session.book.fail(chosen, failure);
+          devlog("换线失败", {
+            provider: toProvider,
+            host: toHost,
+            message: err instanceof Error ? err.message : String(err),
+            evidence: failure.kind,
+            ...(failureCharged.length
+              ? { hostStrikes: failureCharged.map((item) => `${item.host}+${item.weight}`).join(",") }
+              : {}),
+          }, "error");
           console.warn("线路切换失败", err);
+        } finally {
+          watcher?.stop();
+          rejectSwitch = null;
         }
       }
       reportPlayback("playback.failed", {
-        playHost: hostOf(data.playUrl),
+        playHost: data.line?.host || hostOf(data.playUrl),
         episode: data.episodeName || "",
         reason: "no-alternative",
       });
       devlog("换线结束", "没有可用备用线路", "error");
       setStatus("暂时播不了，请稍后再试。", "error");
     } finally {
-      data.failedHostCounts = Object.fromEntries(hostFails);
       switchingLine = false;
     }
   }
@@ -1284,6 +1463,16 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       return new URL(value).host;
     } catch {
       return "";
+    }
+  }
+
+  // 已缓冲到的最远位置（秒），没有缓冲时为 0。
+  function bufferedEnd(video) {
+    try {
+      const ranges = video.buffered;
+      return ranges.length ? ranges.end(ranges.length - 1) : 0;
+    } catch {
+      return 0;
     }
   }
 
@@ -1307,7 +1496,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     document.title = `${displayTitle} · videoshow`;
     reportPlayback("playback.start", {
       pageHost: hostOf(data.sourceUrl),
-      playHost: hostOf(data.playUrl),
+      playHost: data.line?.host || hostOf(data.playUrl),
       provider: data.provider || "",
       episode: data.episodeName || "",
     });
@@ -1339,6 +1528,23 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       episodes: Array.isArray(data.episodes) ? data.episodes : (catalogPlayback ? (currentMedia?.episodes || []) : []),
     };
 
+    // 标题和封面不阻塞起播：事件流里的 meta 事件可能晚于第一条线路，到达后再补。
+    const applyMeta = (meta) => {
+      if (!meta || currentMedia?.sourceUrl !== data.sourceUrl) return;
+      // 目录播放自带标题，不被页面标题覆盖。
+      if (meta.title && !data.episodeName && !data.baseTitle) {
+        currentMedia.baseTitle = cleanBaseTitle(meta.title);
+        currentMedia.title = meta.title;
+        videoTitle.textContent = meta.title;
+        document.title = `${meta.title} · videoshow`;
+      }
+      if (meta.cover && !currentMedia.cover) currentMedia.cover = meta.cover;
+    };
+    if (data.session) {
+      data.session.onMeta = applyMeta;
+      if (data.session.meta) applyMeta(data.session.meta);
+    }
+
     // 手动换线时沿用当前进度；否则只恢复这一集自己的进度。
     const savedRecord = HistoryStore.get(currentMedia.id);
     const resumeTime = Number.isFinite(data.continueAt)
@@ -1348,18 +1554,18 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     const danmakuEndpoint = data.danmaku?.endpoint || "";
     let playbackFailed = false;
     let sourceAttached = data.type !== "m3u8";
-    const failPlayback = (force = false, reason = "") => {
+    const failPlayback = (force = false, reason = "", evidence = null) => {
       if (playbackFailed) {
         // 已在换线：说明是新线路也出了致命错误，立即结束本次尝试，由换线循环换下一个候选。
         if (switchingLine) {
-          rejectSwitch?.(Object.assign(new Error("新线路播放失败"), { weight: failureWeight(reason) }));
+          rejectSwitch?.(Object.assign(new Error("新线路播放失败"), { evidence }));
         }
         return;
       }
       if (!sourceAttached && !force) return;
       playbackFailed = true;
       clearStallTimer();
-      switchToSmootherSource(data, reason);
+      switchToSmootherSource(data, reason, evidence);
     };
 
     window.Artplayer.PLAYBACK_RATE = PLAYBACK_RATES;
@@ -1396,7 +1602,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       theme: "#c6f36b",
       customType: {
         m3u8: (video, url, artInstance) =>
-          playM3u8(video, url, artInstance, (reason) => failPlayback(true, reason), () => {
+          playM3u8(video, url, artInstance, (reason, evidence) => failPlayback(true, reason, evidence), () => {
             sourceAttached = true;
           }),
       },
@@ -1441,6 +1647,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           readyState: current.readyState,
           currentTime: current.currentTime,
           online: navigator.onLine !== false,
+          // 下载进展：hls.js 的清单/分片回调计数 + 已缓冲时长，用来区分“没有数据”和“慢但在下载”。
+          loaded: (activeArt.loadCounter || 0) + Math.round(bufferedEnd(current) * 10),
         }, Date.now());
         if (decision.action !== "switch") return;
         devlog("卡顿超时", {
@@ -1680,7 +1888,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     setLoading(true, msg);
 
     try {
-      const data = await parse(pageUrl);
+      const data = await resolveLines(pageUrl);
       const base = currentMedia?.baseTitle || cleanBaseTitle(currentMedia?.title);
       showResult({
         ...data,
@@ -1816,9 +2024,12 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     }
   }
 
-  async function withEpisodes(pageUrl, data, fallback = []) {
-    let episodes = Array.isArray(fallback) && fallback.length > 1 ? fallback : [];
-    if (episodes.length < 2) episodes = await loadEpisodes(pageUrl);
+  // 选集列表和线路并行获取：第一条线路一到就能起播，不必先等选集。
+  // 选集列表失败不影响播放，只是不显示选集栏。dataPromise 失败则整体失败。
+  async function withEpisodes(pageUrl, dataPromise, fallback = []) {
+    const known = Array.isArray(fallback) && fallback.length > 1 ? fallback : [];
+    const episodesPromise = known.length ? Promise.resolve(known) : loadEpisodes(pageUrl).catch(() => []);
+    const [data, episodes] = await Promise.all([dataPromise, episodesPromise]);
     if (episodes.length < 2) return data;
     const episodeIndex = Math.max(0, episodes.findIndex((episode) => samePage(episode.pageUrl, pageUrl)));
     return {
@@ -1881,7 +2092,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     setStatus("", "");
     searchSection.hidden = true;
     try {
-      const data = await withEpisodes(pageUrl, await parse(pageUrl), episodes);
+      const data = await withEpisodes(pageUrl, resolveLines(pageUrl), episodes);
       const episodeIndex = data.episodeIndex || 0;
       showResult({
         ...data,
@@ -2017,41 +2228,6 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     searchSection.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  async function parse(url, options = {}) {
-    devlog("解析请求", { host: hostOf(url), force: options.force === true }, "info");
-    // force=1 绕过服务端缓存重新解析：换线后用于刷新已过期的单次签名地址。
-    const forceParam = options.force ? "&force=1" : "";
-    const response = await fetch(`/api/parse?url=${encodeURIComponent(url)}${forceParam}`, {
-      headers: { accept: "application/json" },
-    });
-
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch (err) {
-      console.warn("parse response was not JSON", err);
-    }
-
-    if (!response.ok || !payload || payload.ok !== true) {
-      const message =
-        payload?.error?.message || `解析失败（HTTP ${response.status}）`;
-      devlog("解析失败", {
-        status: response.status,
-        code: payload?.error?.code,
-        message,
-      }, "error");
-      throw new Error(message);
-    }
-
-    devlog("解析响应", {
-      status: response.status,
-      provider: payload?.data?.provider,
-      candidates: payload?.data?.candidates?.length || 0,
-      diagnostics: payload?.data?.diagnostics?.length || 0,
-    }, "info");
-    return payload.data;
-  }
-
   /* =========================================================================
      5. 表单提交与事件监听
      ========================================================================= */
@@ -2074,7 +2250,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       setLoading(true, msg);
       searchSection.hidden = true;
       try {
-        const data = await withEpisodes(query, await parse(query));
+        const data = await withEpisodes(query, resolveLines(query));
         showResult(data);
       } catch (err) {
         setStatus(

@@ -6,11 +6,11 @@
 
 - 接受任意 `http(s)` 视频页链接，不做平台域名白名单
 - 支持 `m3u8` 与 `mp4`，按类型校验播放地址
-- 多源并发竞速与自动测速选源：验证媒体后测量分片吞吐与延迟；卡顿时在已验证的线路间自动换源
+- 多源并发解析：线路一通过校验和测速就通过事件流推给浏览器，第一条到达即可起播；卡顿或起播失败时自动换到下一条线路
 - HTTP 解析渠道默认启用：LX、789 页面入口、冰豆、麒麟；LX/麒麟适配播放器配置接口，789 页面入口复用内置上游，冰豆通过无头 Chrome 回退取 MP4
 - 搜索渠道二选一：`API 渠道` 只查聚合接口，`视频网站` 直接查各站搜索；选择保存在浏览器本地
 - jx-browser 按媒体后缀识别 `m3u8`/`mp4`，B 站等 MP4 源不会被误当成 HLS 播放清单
-- 单次签名链接不预读：LX/麒麟返回的媒体地址标记 `singleUse`，由浏览器首次读取，避免服务端校验/测速耗尽签名
+- 短时效线路快照：LX/麒麟的清单地址几秒就过期，服务端在有效期内读取一次并固化成快照，由本站提供给播放器
 - Artplayer + 官方 `artplayer-plugin-danmuku`，支持弹幕显示/隐藏、字号、速度、透明度
 - 选集栏提供“自动下一集”开关，播放结束后续播下一集，偏好保存在浏览器本地
 - 播放器倍速覆盖 `0.5x`–`3.0x`，其中 `1.0x`–`2.0x` 按 `0.1` 递增；弹幕默认字号为 `20`
@@ -40,8 +40,7 @@ https://www.bilibili.com/video/BV1JP41167xK
 内置 `jiexi789` 与四个 HTTP 渠道默认启用，无需额外配置。使用腾讯视频样例地址
 `https://v.qq.com/x/cover/mzc0020098xcllx/e4102s0t1jg.html` 实测：
 
-- LX、麒麟可取得 HLS 地址；服务端不预读该地址，返回 `singleUse: true`，由浏览器首次读取。
-  无头 Chrome 实测播放到 1920×1080，清单与分片请求均成功。
+- LX、麒麟可取得 HLS 地址，属于短时效线路：服务端立即读取清单并做成快照（见下），分片仍由浏览器直连。
 - 789 页面入口最终指向与内置 `jiexi789` 相同的上游；两者返回相同媒体地址时按 URL 去重。
 - 冰豆入口进入 `jiexi.bot.cd/jx/` 的 WASM 播放器；无头 Chrome 执行页面后取得 ByteDance CDN 的
   直接 MP4（1920×1080，`video/mp4`，Range 206），作为回退渠道。最终页面标题可能显示“404”，
@@ -58,11 +57,11 @@ LX、麒麟适配器只读取公开页面中的 `playerConfig.apiToken` 字符�
 789 页面入口只跟随 `*.789jiexi.com` / `*.789jiexi.net` 的 iframe 链路，并复用内置上游取流逻辑。
 第三方响应格式可能变化。
 
-LX/麒麟的媒体地址带临时签名，重复读取次数有限（联调中观察到约两次成功、之后 404）；
-冰豆返回的 ByteDance MP4 也是带 `x-expires`/`x-signature` 的临时地址。
-因此服务端不执行 `validateStream` 或分片测速，而是把地址标记为 `singleUse: true`、`verified: false`
-交给浏览器；已验证线路存在时优先选择已验证线路，单次链接作为备用。`/api/race` 也不会预读这些地址。
-如果上游恢复为可重复读取，仍可继续使用；只是无法在服务端提前测速。
+LX/麒麟的清单地址是**短时效**的：实测可以反复读取，但生成约 6～8 秒后就 404（分片地址则能活到几分钟之后）。
+而解析本身要几秒到十几秒，如果把清单地址原样交给浏览器，线路到手时已经是死的。因此服务端在解析到地址后
+**立刻读一次清单**，把它改写成绝对地址并存为**清单快照**，快照线路的 `playUrl` 指向本站的
+`/api/snapshot`；之后它和其他线路一样做流校验、测速和排序。快照只存在进程内存里，随解析会话（`CACHE_TTL_MS`）一起过期。
+冰豆返回的是直接 MP4，没有清单可取，只能作为未经服务端校验的线路（`verified: false`）交给浏览器首次读取。
 
 本机系统 DNS 将部分媒体域名解析为 `198.18.x.x`（Fake-IP）。`MEDIA_DNS_MODE` 默认 `auto`：
 先使用系统解析；若答案包含私网或 Fake-IP，再通过固定 Google DoH 查询公网 IPv4，检查全部答案后
@@ -93,89 +92,53 @@ HOST=0.0.0.0 PORT=3000 npm start
 
 ## HTTP API
 
-### `GET /api/parse?url=<encoded-video-url>`
+### `GET /api/resolve?url=<encoded-video-url>`
+
+解析是一个**事件流**（`text/event-stream`）：每条线路通过校验和测速就立刻推送，不等其他渠道。
+同一个视频页面的并发请求、以及会话有效期（`CACHE_TTL_MS`）内后来的请求共享同一个**解析会话**：
+后来者先回放已有事件，再接收新事件，不会重复解析。
 
 ```bash
-curl -s 'http://127.0.0.1:3000/api/parse?url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1JP41167xK'
+curl -N 'http://127.0.0.1:3000/api/resolve?url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1JP41167xK'
 ```
 
-```json
-{
-  "ok": true,
-  "data": {
-    "sourceUrl": "https://www.bilibili.com/video/BV1JP41167xK",
-    "playUrl": "https://...",
-    "type": "mp4",
-    "title": null,
-    "cover": null,
-    "expiresAt": "2026-10-17T17:26:49.000Z",
-    "provider": "jx-browser",
-    "singleUse": false,
-    "verified": true,
-    "candidates": [
-      {
-        "provider": "jx-browser",
-        "speedKBps": 2483,
-        "ttfbMs": 88,
-        "available": true,
-        "selected": true,
-        "verified": true,
-        "singleUse": false
-      },
-      {
-        "provider": "jiexi789",
-        "speedKBps": 263,
-        "ttfbMs": 1159,
-        "available": true,
-        "selected": false,
-        "verified": true,
-        "singleUse": false
-      }
-    ],
-    "cached": false,
-    "danmaku": {
-      "provider": "dmku",
-      "endpoint": "/api/danmaku?url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1JP41167xK"
-    }
-  }
-}
+```text
+id: 7f3a9c1e2b04:1
+event: session
+data: {"sourceUrl":"https://www.bilibili.com/video/BV1JP41167xK","pageHost":"www.bilibili.com","danmaku":{"provider":"dmku","endpoint":"/api/danmaku?url=..."}}
+
+id: 7f3a9c1e2b04:4
+event: line
+data: {"id":"7f3a9c1e2b04.L1","provider":"jx-browser","type":"mp4","playUrl":"https://...","host":"cdn.example","segmentHost":"cdn.example","snapshot":false,"shortLived":false,"verified":true,"available":true,"ttfbMs":88,"speedKBps":2483,"score":1318,"key":"bb50c7abae96806b","round":1}
+
+event: end
+data: {}
 ```
 
-- `type` 可能是 `m3u8` 或 `mp4`。
-- `title`/`cover` 可能为 `null`；目前只有可选的爱奇艺适配器会填充。
-- 上游返回的广告 `title` 永远不会被透传。
-- `danmaku.endpoint` 是相对地址，前端直接请求。
-- `singleUse`/`verified`：选中地址是否为单次签名链接，以及是否经过服务端媒体校验。
-  `singleUse: true` 表示服务端没有预读该地址，浏览器应只读取一次。
-- `playUrl` 优先为验证和测速均通过的选中地址；没有已验证线路时才返回单次链接。
-  `candidates` 中测速失败的地址标记为 `available: false`、`selected: false`，客户端不能将其作为可用备用。
-  单次链接候选标记为 `singleUse: true`、`verified: false`、`available: true`，可作为换线备用。
-  全部线路不可用时返回 `502`。
+| 事件 | 含义 |
+|---|---|
+| `session` | 会话开始，带弹幕接口地址 |
+| `round` | 一轮解析开始 |
+| `diagnostic` | 某个渠道的结果：`benchmarked`、`snapshot`、`unverified`、`duplicate`、`rejected`、`benchmark-rejected`、`fallback-skipped`、`cooldown`、`empty`，含耗时、错误码和原因 |
+| `line` | 一条可用线路。`id` 全局唯一（带会话编号）；`playUrl` 是原始地址，快照线路则是 `/api/snapshot?...` |
+| `meta` | 标题和封面，晚于第一条线路，不阻塞起播；只有可选的爱奇艺适配器会填充，上游返回的广告标题永远不会被透传 |
+| `done` | 这一轮结束，带 `lines`（累计）和 `newLines`（本轮新增） |
+| `failed` | 这一轮结束且会话里一条线路都没有：`STREAM_INVALID` / `PARSE_FAILED`；失败不会被缓存，下一位观众会重新解析 |
+| `end` | 本次响应结束的明确标记；没有收到 `end` 就断开说明需要重连 |
 
-### `POST /api/race`
+- 每个事件带 `id: <会话编号>:<序号>`。断线重连时带 `Last-Event-ID` 请求头或 `after=<事件编号>` 参数，服务端只回放之后的事件；游标属于别的会话时从头回放。
+- `refresh=1`：线路都用完的观众要求在**原会话上追加一轮**解析。两轮之间至少间隔 `PARSE_REFRESH_MIN_MS`，
+  被限流时只回放已有事件并 `end`，客户端据此知道没有新线路。会话里一条线路都没有时，后来的观众也会触发新一轮（同样受间隔限制）。
+- **去重**：同一个播放列表域名上分片列表完全相同的线路只保留先到的（分片地址里的令牌不参与比较）；
+  分片相同但播放列表域名不同的线路不算重复。去重在会话内跨轮次生效；某条线路测速失败会释放它的指纹，让内容相同的后到线路还有机会重测。
+- `line.score` 以吞吐为主、首字节为辅：`speedKBps / (1 + ttfbSeconds)`；`unmeasured: true` 表示内容校验通过但测速没跑完。
+  测速确认不可用的线路只出现在 `diagnostic` 里，不会作为 `line` 推送。
+- 连接每 `STREAM_HEARTBEAT_MS` 发一次 `: ping` 注释，并带 `X-Accel-Buffering: no` 提示反向代理不要缓冲。
 
-换线重测仅接受已解析页面的服务端缓存候选：
+### `GET /api/snapshot?s=<会话编号>&l=<线路编号>`
 
-```json
-{ "sourceUrl": "https://www.iqiyi.com/v_demo.html", "failedPlayUrls": ["https://cdn.example/video.m3u8"] }
-```
-
-返回的 `data.selected` 为剩余线路的最佳可用候选，或 `null`。
-`data.filtered` 给出候选过滤情况：`total`、`excluded`、`expired`、`remaining`。
-无剩余候选时客户端会重新解析一次，以刷新单次签名地址。
-已验证候选会重新测速；单次链接候选直接返回，不发起媒体请求，避免消耗签名。
-测速评分 `score` 以吞吐为主、首字节为辅：`speedKBps / (1 + ttfbSeconds)`。
-
-请求体还可带两个域名列表（各最多 20 项，用于避免在同一个失效的 CDN 域名上反复重试）：
-
-- `avoidHosts`：失败过 1 次的域名。换线时其他域名的候选优先，没有别的选择时仍可退回重试。
-- `blockedHosts`：已失败 2 次的域名，其候选直接排除，计入 `data.filtered.hostBlocked`。
-
-选择顺序为：未失败域名的已验证线路 > 未失败域名的单次链接 > 失败域名的已验证线路 > 失败域名的单次链接。
-
-`/api/parse` 不再等所有渠道跑完：拿到第一条可用的已验证线路后，再等 `PARSE_GRACE_MS` 就响应，
-仍在运行的渠道在响应的 `diagnostics` 里标为 `background`，完成后补进缓存，供 `/api/race` 换线使用。
-只有单次链接、没有已验证线路时仍会等到所有主渠道结束。
+返回短时效线路的清单快照（`application/vnd.apple.mpegurl`，`no-store`），分片和 KEY/MAP 地址均已改写为绝对地址。
+只服务解析会话里已存在的快照，不接受任何外部传入的地址；会话过期后返回 `404 SNAPSHOT_EXPIRED`。
 
 ### 卡顿判定与自动换线
 
@@ -183,12 +146,15 @@ curl -s 'http://127.0.0.1:3000/api/parse?url=https%3A%2F%2Fwww.bilibili.com%2Fvi
 
 | 层 | 判定 | 动作 |
 |---|---|---|
-| 起播失败 | 10 秒内没有数据（暂停时只看元数据，播放时看能否连续播放） | 换线 |
+| 起播失败 | 连续 10 秒没有任何数据进展（清单、分片都没有动静）；有数据在下载时最多放宽到 20 秒。暂停时只看元数据，播放时看能否连续播放 | 换线 |
 | 硬卡死 | 播放中连续断流 5 秒 | 换线；断流满 3 秒时先自救一次（降一档清晰度、让 HLS 重新拉分片） |
 | 慢性卡顿 | 60 秒窗口内卡顿 ≥3 次（单次 ≥1 秒），或 ≥2 次且卡顿占比 ≥15% | 换线，且换线后 30 秒内不因此再换 |
 
 暂停、拖动进度条（含之后 3 秒宽限）、断网、播放结束都不算线路卡顿。
-换线最多尝试 8 次；新线路 12 秒内没有出数据、或加载中出现 HLS 致命错误，都会立即视为本次尝试失败并换下一个候选。
+换线只在起播失败或卡顿时发生：正常播放时不会因为后到了更好的线路而切换。
+换线的下一条线路来自客户端的**线路簿**（`public/line-book.js`）：已校验的、得分高的优先，失败过一次的域名排在其他域名之后。
+线路簿里没有可用线路、但解析还在进行时，先等后到的线路（最多 30 秒）；仍然没有，就在原解析会话上追加一轮（每次换线最多一轮）。
+新线路连续 12 秒没有下载进展（有进展时最多 24 秒）、或加载中出现 HLS 致命错误，都立即视为本次尝试失败。
 
 ### 拼接广告过滤
 
@@ -211,12 +177,15 @@ curl -s 'http://127.0.0.1:3000/api/parse?url=https%3A%2F%2Fwww.bilibili.com%2Fvi
 3. 当天没有一次可用结果；
 4. 当天至少有另一个渠道成功过。否则是断网、代理故障这类整体问题，不怪渠道。
 
-不可用的天数**累计**（不要求连续）达到 `CHANNEL_DEAD_DAYS` 就摘除，只保留最近 30 个自然日的记录。
-"可用"指产出了可用线路（含未测速、单次链接、与其他渠道地址重复）；没装 Chrome、DevTools 起不来这类本机问题不计入。
+**连续**不可用的天数达到 `CHANNEL_DEAD_DAYS` 就摘除：按时间顺序看已结束的日子，任何一个有可用结果的日子都会把计数清零；样本不足的日子和整体故障的日子不下结论（既不计数也不清零）。只保留最近 30 个自然日的记录。
+"可用"指产出了可用线路（含未测速、快照线路、与其他渠道地址重复）；没装 Chrome、DevTools 起不来这类本机问题不计入。
 摘除后该渠道不再被调用，`GET /api/channels` 可查看每个渠道的状态、今日尝试/成功次数和摘除原因（不含渠道地址）。
 
-**复活**：被摘除的渠道，外部配置给了**新的 endpoint**，或把 `revision` 调大，就会重新启用并重新累计；
-地址不变的重复配置不会让它复活。没有地址的内置渠道（`jiexi789`、`jx-browser`）只能靠 `revision`。
+**自动复活（试探）**：被摘除的渠道每隔 `CHANNEL_PROBE_MINUTES` 分钟（默认 360）会被放回某一轮解析里跑一次。产出了可用线路就立即复活并重新累计，线路照常推给观众；失败则继续等下一个间隔，不进入当天统计。同一时刻只会有一个解析会话领到试探，间隔和失败次数落盘，重启不重置。设为 `0` 关闭试探。
+
+**手动复活**：外部配置给了**新的 endpoint**，或把 `revision` 调大，也会重新启用并重新累计；地址不变的重复配置不会让它复活。被外部配置停用（`enabled: false`）的渠道不参与试探。
+
+`GET /api/channels` 对被摘除的渠道会额外给出 `nextProbeAt`（下次试探时间）和 `probeFailures`（试探失败次数）。
 
 **外部配置**（`CHANNEL_CONFIG_URL`）返回：
 
@@ -224,13 +193,13 @@ curl -s 'http://127.0.0.1:3000/api/parse?url=https%3A%2F%2Fwww.bilibili.com%2Fvi
 {
   "channels": [
     { "id": "lx", "endpoint": "https://jx.example.com/index.php?url=", "revision": 1 },
-    { "id": "extra", "name": "新增渠道", "endpoint": "https://extra.example.com/?url=", "parser": "generic", "singleUse": false },
+    { "id": "extra", "name": "新增渠道", "endpoint": "https://extra.example.com/?url=", "parser": "generic", "shortLived": false },
     { "id": "qilin", "enabled": false }
   ]
 }
 ```
 
-- 同 `id` 的内置渠道可改 `name`、`endpoint`、`parser`、`singleUse`、`fallback`，没写的字段保持原样；新渠道必须有 `endpoint`。
+- 同 `id` 的内置渠道可改 `name`、`endpoint`、`parser`、`shortLived`（旧名 `singleUse` 仍被接受）、`fallback`，没写的字段保持原样；新渠道必须有 `endpoint`。
 - `parser` 取值：`lx`、`jiexi789-page`、`bingdou`、`qilin`、`generic`（默认；按页面里的媒体地址或重定向提取）。
 - `enabled: false` 停用渠道，包括 `jiexi789`、`jx-browser`；条目不在配置里则恢复内置行为。
 - `endpoint` 会被服务端当作请求目标，所以只接受：https、无账号密码、默认端口、非 IP、非内网域名、以 `=` 结尾（用于拼接视频地址）。
@@ -238,15 +207,15 @@ curl -s 'http://127.0.0.1:3000/api/parse?url=https%3A%2F%2Fwww.bilibili.com%2Fvi
 
 ### 线路筛选与失败判定
 
-- **单次链接先查 DNS**：单次签名链接不能预先请求（会消耗签名），但解析阶段会只查一次公共 DNS，
-  域名已不存在（NXDOMAIN）的直接剔除，诊断里标为 `HOST_UNREACHABLE`，不必等起播超时。查不出结论时保留。
 - **测速没跑完 ≠ 不可用**：已通过内容校验的线路，如果测速因超时、网络错误或服务端 DNS 校验被拦而没测成，
   保留为"未测速"（`unmeasured: true`，诊断里写明原因），排在已测速线路之后；
   只有 HTTP 错误码、返回 HTML、播放列表无效这类明确的内容问题才判为不可用。
-- **失败按域名计权**：起播 10 秒没数据、或播放列表（manifest）都加载不出来，说明域名连不上，计 2 次直接排除；
-  卡顿之类计 1 次，换线时让其他域名优先。播放列表加载另有更短的超时与重试，尽快交给换线。
-缓存过期返回 `409 PARSE_EXPIRED`，客户端重新调用 `/api/parse`。
-原来提交任意 `candidates` 地址的 POST 和 `sources` GET 不再支持。
+- **失败按证据分级记账**（`public/line-book.js` 的 `classifyFailure`，有单元测试）：
+  - 清单返回 HTTP 4xx/5xx（链接过期、没有权限）、起播超时、卡顿、媒体解码错误：**只排除这一条线路**；
+  - 清单或分片所在域名连不上（浏览器网络错误计 2 次，超时计 1 次；经本站中转时的 502/503/504 同属此类）：**按域名累计**，达到 2 次该域名上的线路都不再尝试，失败 1 次的域名排在其他域名之后；
+  - 快照线路的清单由本站提供，清单失败不牵连它的原始域名；
+  - 起播失败但清单已读到：对分片域名只记 1 次（证据不足）。
+  失败只影响当前观众：不改共享会话的线路排序，也不计入渠道健康账本。
 
 ### `GET /api/danmaku?url=<encoded-video-url>`
 
@@ -294,9 +263,9 @@ curl -s 'http://127.0.0.1:3000/api/danmaku?url=https%3A%2F%2Fwww.iqiyi.com%2Fv_1
 
 ```text
 浏览器
-  │  GET /api/parse?url=...
+  │  GET /api/resolve?url=...   (SSE：线路陆续到达，可 refresh / 断线续传)
   ▼
-src/server.js
+src/server.js            解析会话（src/parse-session.js）：事件日志、回放、清单快照、去重
   ├─ 并发提取候选流：
   │    ├─ src/provider.js           (789jiexi 纯 HTTP 上游)
   │    ├─ src/providers/jx-browser.js (无头 Chrome 自动化提取腾讯/官方 CDN)
@@ -306,13 +275,14 @@ src/server.js
   ├─ src/media-network.js   公网 DNS、地址固定、超时与取消
   ├─ src/benchmark.js       并发测试分片真实吞吐 (KB/s) 与 TTFB，自动择优
   ├─ src/stream.js          按 type 校验：m3u8 查 #EXTM3U；mp4 用 HEAD/Range
+  ├─ src/playlist.js        清单快照改写成绝对地址、线路内容指纹
   ├─ src/metadata.js        可选元数据适配器调度
   └─ GET /api/danmaku
        └─ src/danmaku.js    dmku → 过滤/排序/映射
   ▼
 public/app.js + Artplayer + hls.js + artplayer-plugin-danmuku
-  ├─ 自动加载测速胜出的最快播放源，流畅秒开
-  ├─ 界面渲染测速标签，支持用户手动一键切换其他线路
+  ├─ resolve-stream.js 读取事件流（断线续传），line-book.js 管理线路与失败记账
+  ├─ 第一条线路到达即起播；起播失败或卡顿时自动换线（没有手动切线入口）
   ├─ 选集栏自动下一集开关；全集弹层长标题自动换行
   └─ 弹幕异步加载；失败不影响播放
 ```
@@ -321,12 +291,12 @@ public/app.js + Artplayer + hls.js + artplayer-plugin-danmuku
 
 页面左下角有一个默认折叠的 `DEV` 面板，仅用于开发排查，不参与播放布局：
 
-- 解析请求/响应，以及每个渠道的诊断状态（`benchmarked`、`single-use`、`rejected`、`fallback-skipped` 等）、
+- 解析会话事件（解析轮次、收到的线路、解析完成/失败），以及每个渠道的诊断状态（`benchmarked`、`snapshot`、`duplicate`、`rejected`、`fallback-skipped` 等）、
   总耗时 `ms`、`ttfbMs`、`speedKBps`、`score` 和错误信息。
-- 渠道延迟排行：已验证渠道按 `TTFB` 升序，单次链接/失败渠道按解析耗时排序；
+- 渠道延迟排行：已验证渠道按 `TTFB` 升序，快照线路/失败渠道按解析耗时排序；
   失败项会显示 `code` 与上游 `detail`（例如 `upstreamCode=404`）。
-- 初始选择依据：可用优先 > 已验证优先 > `score` 高 > `TTFB` 低；没有已验证线路时使用 `singleUse` 签名地址。
-- 播放卡顿触发、`/api/race` 请求与候选、换线 `from → to`、切换成功/失败，以及 HLS 网络/致命错误。
+- 初始选择依据：最先到达的可用线路；换线时按域名失败情况 > 已验证 > `score` 高 > `TTFB` 低选下一条。
+- 播放卡顿触发、换线时累计的失败证据与域名失败、等待后台线路、追加一轮解析、换线 `from → to`、切换成功/失败，以及 HLS 网络/致命错误。
 - 日志只保存在当前页面内存，最多 200 条，刷新清空，不会写入服务端。
 
 ## 配置
@@ -343,11 +313,13 @@ public/app.js + Artplayer + hls.js + artplayer-plugin-danmuku
 | `ENABLE_BROWSER_PROVIDER` | `true` | 是否启用无头浏览器提取器；冰豆回退渠道也依赖此开关 |
 | `HTTP_PROVIDER_IDS` | 全部 | 逗号分隔的渠道 ID；未设置时启用全部，空字符串表示全部关闭 |
 | `HTTP_PROVIDER_TIMEOUT_MS` | `12000` | 每个 HTTP 渠道从入口到媒体地址的总超时（毫秒） |
-| `PARSE_GRACE_MS` | `3000` | 解析提前响应的宽限：拿到第一条可用的已验证线路后再等这么久，让同样快的线路一起择优，其余渠道转后台继续并补进换线候选；`0` 表示立即响应 |
+| `PARSE_REFRESH_MIN_MS` | `15000` | 同一个解析会话两轮解析之间的最小间隔：线路用完的观众请求追加一轮时，间隔内不会再跑一轮，避免上游被连续打满 |
+| `STREAM_HEARTBEAT_MS` | `15000` | 解析事件流的心跳间隔，避免反向代理把长时间没有数据的连接当作空闲连接断开 |
 | `CHANNEL_CONFIG_URL` | 空 | 渠道外部配置接口（必须 https，返回 JSON，格式见下）；为空则只用内置渠道 |
 | `CHANNEL_CONFIG_REFRESH_MS` | `600000` | 外部配置的刷新间隔；拉取失败后 1 分钟重试，期间沿用上一次成功的配置 |
 | `CHANNEL_STATE_FILE` | `data/channel-state.json` | 渠道健康账本的落盘位置；Vercel 等只读环境默认只用内存；设为空字符串可关闭落盘 |
-| `CHANNEL_DEAD_DAYS` | `3` | 累计多少个自然日不可用后摘除渠道 |
+| `CHANNEL_DEAD_DAYS` | `3` | 连续多少个自然日不可用后摘除渠道 |
+| `CHANNEL_PROBE_MINUTES` | `360` | 被摘除的渠道每隔多少分钟试探一次，成功就自动复活；`0` 关闭 |
 | `CHANNEL_MIN_DAILY_ATTEMPTS` | `3` | 一个自然日至少尝试多少次才下结论，流量太小的日子不计入 |
 | `CHANNEL_TIMEZONE` | 服务器本地时区 | 划分"自然日"的时区，例如 `Asia/Shanghai` |
 | `CHROME_BIN` | Linux：`/usr/bin/google-chrome`；Windows：自动探测 `Program Files`、`Program Files (x86)`、`%LOCALAPPDATA%` 下的 Chrome，找不到时用 Edge | 无头浏览器可执行文件路径 |
@@ -358,8 +330,8 @@ public/app.js + Artplayer + hls.js + artplayer-plugin-danmuku
 | `DANMAKU_TIMEOUT_MS` | `10000` | 弹幕请求超时 |
 | `STREAM_TIMEOUT_MS` | `10000` | 播放地址校验超时 |
 | `MEDIA_DNS_MODE` | `auto` | 服务端媒体 DNS：`auto` 系统解析并在 Fake-IP/私网答案时回退公网 DoH；`public` 强制 DoH；`system` 禁用回退；`auto` 在系统 DNS 直接报错时同样回退。公共 DNS 并行查询阿里、DNSPod、Cloudflare、Google 四个固定 DoH 端点，谁先返回有效答案用谁 |
-| `CACHE_TTL_MS` | `300000` | 解析/弹幕缓存时间 |
-| `CACHE_MAX_ENTRIES` | `200` | 缓存条目上限 |
+| `CACHE_TTL_MS` | `300000` | 解析会话（含清单快照）和弹幕缓存的有效期 |
+| `CACHE_MAX_ENTRIES` | `200` | 解析会话和弹幕缓存的条目上限 |
 
 示例：
 
@@ -376,7 +348,7 @@ npm test
 ```
 
 覆盖 LX/麒麟播放器配置提取、同站接口、令牌脱敏、789 页面链路校验、冰豆浏览器回退与懒执行、
-单次链接不预读、逐候选择优、媒体校验与测速失败隔离，以及系统 DNS/Fake-IP 自动回退和公网 DNS 的
+清单快照、解析会话（共享/回放/追加/限流/断线续传）、线路簿的失败分级、媒体校验与测速失败隔离，以及系统 DNS/Fake-IP 自动回退和公网 DNS 的
 TTL/大小约束、私网拒绝、连接固定、重定向、压缩、连接取消和缺失响应长度。
 离线测试通过不等于上游可持续播放。
 

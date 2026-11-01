@@ -36,7 +36,11 @@ export const config = {
       .map((id) => id.trim())
       .filter(Boolean),
   httpProviderTimeoutMs: intEnv("HTTP_PROVIDER_TIMEOUT_MS", 12000),
-  parseGraceMs: intEnv("PARSE_GRACE_MS", 3000),
+  // 同一个解析会话两轮解析之间的最小间隔：客户端线路耗尽后会请求追加一轮，
+  // 多位观众同时请求、或同一位观众反复请求，都不能让上游被连续打满。
+  parseRefreshMinMs: intEnv("PARSE_REFRESH_MIN_MS", 15000),
+  // 事件流的心跳间隔，避免反向代理把长时间没有数据的连接当作空闲连接断开。
+  streamHeartbeatMs: intEnv("STREAM_HEARTBEAT_MS", 15000),
   channelConfigUrl: process.env.CHANNEL_CONFIG_URL || "",
   channelConfigRefreshMs: intEnv("CHANNEL_CONFIG_REFRESH_MS", 600000),
   devPassword: process.env.DEV_PASSWORD || "adminysdev",
@@ -48,6 +52,8 @@ export const config = {
       : path.join(projectRoot, "data", "channel-state.json"),
   channelDeadDays: intEnv("CHANNEL_DEAD_DAYS", 3),
   channelMinDailyAttempts: intEnv("CHANNEL_MIN_DAILY_ATTEMPTS", 3),
+  // 被摘除的渠道每隔多少分钟放回一轮解析里试探一次，成功就自动复活；0 表示不试探。
+  channelProbeMinutes: intEnv("CHANNEL_PROBE_MINUTES", 360),
   channelTimezone: process.env.CHANNEL_TIMEZONE || "",
   benchmarkTimeoutMs: intEnv("BENCHMARK_TIMEOUT_MS", 3000),
   requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15000),

@@ -39,7 +39,7 @@ test("endpoint validation only allows public https prefixes", () => {
 test("remote entries are normalised and bad ones are dropped individually", () => {
   const { accepted, rejected } = parseRemoteChannels({
     channels: [
-      { id: "LX", endpoint: "https://jx.example.com/?url=", name: " 新名字 ", revision: 2, singleUse: true },
+      { id: "LX", endpoint: "https://jx.example.com/?url=", name: " 新名字 ", revision: 2, shortLived: true },
       { id: "bad id" },
       { id: "dup", endpoint: "https://a.example.com/?url=" },
       { id: "dup", endpoint: "https://b.example.com/?url=" },
@@ -52,7 +52,11 @@ test("remote entries are normalised and bad ones are dropped individually", () =
   assert.deepEqual(accepted.map((item) => item.id), ["lx", "dup", "off"]);
   assert.equal(accepted[0].name, "新名字");
   assert.equal(accepted[0].revision, 2);
-  assert.equal(accepted[0].singleUse, true);
+  assert.equal(accepted[0].shortLived, true);
+  // 旧版配置里的 singleUse 继续被接受，按 shortLived 处理。
+  const legacy = parseRemoteChannels([{ id: "old", endpoint: "https://a.example.com/?url=", singleUse: true }]);
+  assert.equal(legacy.accepted[0].shortLived, true);
+  assert.equal("singleUse" in legacy.accepted[0], false);
   assert.equal(accepted[2].enabled, false);
   assert.deepEqual(rejected.map((item) => item.id), ["bad id", "dup", "evil", "parser", "rev"]);
   assert.throws(() => parseRemoteChannels({ nope: [] }), /channels/);
@@ -83,7 +87,7 @@ test("remote config overrides addresses, adds channels and disables others", asy
   const byId = Object.fromEntries(registry.httpChannels().map((channel) => [channel.id, channel]));
   assert.equal(byId.lx.endpoint, "https://new-lx.example.com/index.php?url=");
   assert.equal(byId.lx.resolveResponse, HTTP_CHANNELS.find((item) => item.id === "lx").resolveResponse, "沿用原解析器");
-  assert.equal(byId.lx.singleUse, true);
+  assert.equal(byId.lx.shortLived, true);
   assert.equal(byId.extra.name, "新增渠道");
   assert.equal(byId.extra.parser, "generic");
   assert.equal(byId.qilin, undefined);
@@ -200,7 +204,7 @@ test("removed channels leave the registry and come back when the config gives a 
   assert.equal(ids(registry).includes("lx"), false, "摘除后不再参与解析");
   const removed = registry.status().channels.find((item) => item.id === "lx");
   assert.equal(removed.state, "removed");
-  assert.match(removed.reason, /累计 1 个自然日不可用/);
+  assert.match(removed.reason, /连续 1 个自然日不可用/);
   assert.equal(JSON.stringify(registry.status()).includes("jx.lxyy.club"), false, "状态里不暴露渠道地址");
 
   await registry.refresh();

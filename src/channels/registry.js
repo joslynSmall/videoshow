@@ -85,8 +85,12 @@ export function parseRemoteChannels(payload) {
       }
       entry.endpoint = raw.endpoint;
     }
-    for (const flag of ["singleUse", "fallback", "deleted"]) {
+    for (const flag of ["shortLived", "fallback", "deleted"]) {
       if (raw[flag] !== undefined) entry[flag] = raw[flag] === true;
+    }
+    // 旧版配置里叫 singleUse（“单次签名”），实测并非单次，只是短时效；继续接受以免已发布的配置失效。
+    if (raw.shortLived === undefined && raw.singleUse !== undefined) {
+      entry.shortLived = raw.singleUse === true;
     }
     accepted.push(entry);
   }
@@ -177,7 +181,7 @@ export function createChannelRegistry({
         name: entry.name ?? builtin?.name ?? entry.id,
         endpoint: entry.endpoint ?? builtin?.endpoint,
         parser: entry.parser ?? (builtin ? parserNameOf(builtin) : "generic"),
-        singleUse: entry.singleUse ?? builtin?.singleUse === true,
+        shortLived: entry.shortLived ?? builtin?.shortLived === true,
         fallback: entry.fallback ?? builtin?.fallback === true,
       };
       if (!spec.endpoint) {
@@ -185,7 +189,7 @@ export function createChannelRegistry({
         continue;
       }
       const unchanged = builtin && spec.endpoint === builtin.endpoint && spec.name === builtin.name &&
-        spec.parser === parserNameOf(builtin) && spec.singleUse === (builtin.singleUse === true) &&
+        spec.parser === parserNameOf(builtin) && spec.shortLived === (builtin.shortLived === true) &&
         spec.fallback === (builtin.fallback === true);
       channels.set(entry.id, unchanged ? builtin : createHttpChannel(spec));
     }
@@ -251,6 +255,23 @@ export function createChannelRegistry({
     record(id, ok) {
       health?.record(id, ok);
     },
+    // 已被账本摘除、但没有被外部配置停用的渠道：只用于定期试探，成功了会自动复活。
+    removedHttpChannels() {
+      return active.filter((channel) => health?.isRemoved(channel.id) && !remote.disabled?.has(channel.id));
+    },
+    removedBrowserChannels() {
+      return browserChannels.filter((b) => health?.isRemoved(b.id) && !remote.disabled?.has(b.id));
+    },
+    isRemoved(id) {
+      return Boolean(health?.isRemoved(id)) && !remote.disabled?.has(id);
+    },
+    // 到了试探时间才返回 true，并立即占位，避免并发会话重复试探。
+    claimProbe(id) {
+      return health?.claimProbe?.(id) ?? false;
+    },
+    recordProbe(id, ok) {
+      return health?.recordProbe?.(id, ok) ?? false;
+    },
     refresh,
     // 不阻塞调用方：过期了就在后台刷新。
     ensureFresh() {
@@ -310,7 +331,14 @@ export function createChannelRegistry({
           unavailableDays: detail?.unavailableDays ?? [],
           lastSuccessDay: detail?.lastSuccessDay || null,
           today: detail?.today ?? { attempts: 0, successes: 0 },
-          ...(detail?.removed ? { removedAt: detail.removed.at, reason: detail.removed.reason } : {}),
+          ...(detail?.removed
+            ? {
+                removedAt: detail.removed.at,
+                reason: detail.removed.reason,
+                nextProbeAt: detail.nextProbeAt,
+                probeFailures: detail.removed.probeFailures || 0,
+              }
+            : {}),
         };
       });
       return {

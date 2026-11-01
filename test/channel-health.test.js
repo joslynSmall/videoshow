@@ -45,11 +45,11 @@ test("a channel is removed after three unavailable natural days, not before", ()
   record("good", true);
   assert.equal(health.isRemoved("lx"), true);
   assert.equal(health.isRemoved("good"), false);
-  assert.equal(health.status("lx").removed.reason, "累计 3 个自然日不可用");
+  assert.equal(health.status("lx").removed.reason, "连续 3 个自然日不可用");
   assert.deepEqual(health.evaluate(), [], "已摘除的不会重复上报");
 });
 
-test("unavailable days accumulate without needing to be consecutive", () => {
+test("unavailable days must be consecutive: a usable day resets the count", () => {
   const { health, day, record } = clockHealth();
   for (const [n, lxOk] of [[1, false], [2, true], [3, false], [4, true], [5, false]]) {
     day(n);
@@ -59,8 +59,32 @@ test("unavailable days accumulate without needing to be consecutive", () => {
   day(6);
   record("good", true);
   health.evaluate();
-  assert.equal(health.isRemoved("lx"), true, "第 1、3、5 天不可用，累计 3 天");
-  assert.deepEqual(health.status("lx").removed.unavailableDays, ["2026-10-01", "2026-10-03", "2026-10-05"]);
+  assert.equal(health.isRemoved("lx"), false, "第 1、3、5 天不可用但中间有可用日，不算连续");
+  assert.deepEqual(health.status("lx").unavailableDays, ["2026-10-05"]);
+});
+
+test("days with too few attempts or a whole outage neither count nor reset the streak", () => {
+  const { health, day, record } = clockHealth({ minAttempts: 3 });
+  day(1);
+  record("lx", false, 3);
+  record("good", true, 3);
+  day(2);
+  record("lx", false, 1);
+  record("good", true, 3);
+  day(3);
+  record("lx", false, 3);
+  record("good", false, 3);
+  day(4);
+  record("lx", false, 3);
+  record("good", true, 3);
+  day(5);
+  record("lx", false, 3);
+  record("good", true, 3);
+  day(6);
+  record("good", true);
+  health.evaluate();
+  assert.deepEqual(health.status("lx").unavailableDays, ["2026-10-01", "2026-10-04", "2026-10-05"]);
+  assert.equal(health.isRemoved("lx"), true);
 });
 
 test("a day with at least one success is a usable day", () => {
@@ -215,6 +239,74 @@ test("an unwritable state location degrades to memory without throwing", () => {
     assert.doesNotThrow(() => health.flush());
     assert.deepEqual(warnings, ["channel.state_save_failed"], "只告警一次");
     assert.equal(health.status("lx").today.attempts, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function removedLx(options = {}) {
+  const ctx = clockHealth({ deadDays: 1, ...options });
+  ctx.health.setEndpoint("lx", "https://old.example/?url=");
+  ctx.day(1);
+  ctx.record("lx", false, 3);
+  ctx.record("good", true, 3);
+  ctx.day(2);
+  ctx.record("good", true);
+  ctx.health.evaluate();
+  assert.equal(ctx.health.isRemoved("lx"), true);
+  return ctx;
+}
+
+test("a removed channel is probed on a schedule, and a successful probe revives it", () => {
+  const events = [];
+  const { health, clock } = removedLx({
+    probeIntervalMs: 3_600_000,
+    logger: { info: (event, fields) => events.push([event, fields]), warn() {} },
+  });
+  assert.equal(health.claimProbe("lx"), false, "刚摘除，还没到第一次试探时间");
+  assert.equal(health.status("lx").nextProbeAt, new Date(clock.now + 3_600_000).toISOString());
+
+  clock.now += 3_600_000;
+  assert.equal(health.claimProbe("lx"), true);
+  assert.equal(health.claimProbe("lx"), false, "放行即占位，并发会话不会重复试探");
+  assert.equal(health.recordProbe("lx", false), false);
+  assert.equal(health.status("lx").removed.probeFailures, 1);
+  assert.equal(health.isRemoved("lx"), true);
+  assert.equal(health.claimProbe("lx"), false, "失败后要等下一个间隔");
+
+  clock.now += 3_600_000;
+  assert.equal(health.claimProbe("lx"), true);
+  assert.equal(health.recordProbe("lx", true), true);
+  assert.equal(health.isRemoved("lx"), false);
+  assert.deepEqual(health.status("lx").unavailableDays, [], "复活后重新累计");
+  assert.equal(health.status("lx").nextProbeAt, null);
+  assert.deepEqual(events.at(-1), ["channel.revived", { provider: "lx", reason: "probe_succeeded" }]);
+  assert.equal(health.recordProbe("lx", true), false, "没被摘除的渠道没有试探可记");
+  assert.equal(health.claimProbe("lx"), false);
+});
+
+test("probing can be switched off and survives a restart", () => {
+  const off = removedLx({ probeIntervalMs: 0 });
+  off.clock.now += 30 * 86_400_000;
+  assert.equal(off.health.claimProbe("lx"), false, "间隔为 0 表示不试探");
+  assert.equal(off.health.status("lx").nextProbeAt, null);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vs-health-"));
+  const file = path.join(dir, "state.json");
+  try {
+    const first = removedLx({ file, probeIntervalMs: 3_600_000 });
+    first.clock.now += 3_600_000;
+    assert.equal(first.health.claimProbe("lx"), true);
+    first.health.recordProbe("lx", false);
+    first.health.flush();
+
+    const second = clockHealth({ file, probeIntervalMs: 3_600_000 });
+    second.clock.now = first.clock.now + 60_000;
+    assert.equal(second.health.isRemoved("lx"), true);
+    assert.equal(second.health.status("lx").removed.probeFailures, 1, "试探次数跨重启保留");
+    assert.equal(second.health.claimProbe("lx"), false, "重启不会重置试探间隔");
+    second.clock.now += 3_600_000;
+    assert.equal(second.health.claimProbe("lx"), true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -29,8 +29,24 @@ Discovery of an official watch page on a domestic video site when a title is abs
 _Avoid_: Site scrape, Web fallback, Direct resolution
 
 **Ordered Line Switch**:
-Sequential client-side switching through pre-ranked candidate streams delivered by the initial parse response upon playback stall or startup failure.
+Sequential client-side switching through the lines the client holds, including Late Lines, upon playback stall or startup failure; healthy playback is never interrupted to move to a better line.
 _Avoid_: Dynamic Race, Background Benchmark, Multi-hop Retry
+
+**Late Line** (后台线路):
+A line that reaches the client after playback has already started on an earlier line, delivered through the Parse Session's event stream.
+_Avoid_: Background candidate, Appended line
+
+**Short-lived Line** (短时效线路):
+A line whose playlist address expires within seconds of being resolved but can be read repeatedly until then.
+_Avoid_: Single-use link, 单次签名链接, singleUse
+
+**Playlist Snapshot** (清单快照):
+A stored copy of a Short-lived Line's playlist, taken within its lifetime, which keeps the line playable after the original playlist address expires.
+_Avoid_: 固化清单, Cached link
+
+**Parse Session** (解析会话):
+The shared, time-bounded resolution of one video page, during which its lines appear one by one; every viewer of that page joins the same session, and it may run further resolution rounds when viewers run out of lines.
+_Avoid_: Parse request, Parse cache entry
 
 **Channel Console**:
 The password-protected administrative interface allowing developers to inspect real-time playback logs, audit source health/culling ledgers, and dynamically add or remove parsing channels.

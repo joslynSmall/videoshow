@@ -49,14 +49,20 @@ function sanitize(raw) {
   return state;
 }
 
-// 渠道健康账本：按自然天累计"可用/不可用"，累计够天数就把渠道摘除。
+// 渠道健康账本：按自然天记录"可用/不可用"，连续不可用够天数就把渠道摘除，
+// 摘除后定期试探，试探成功就自动复活。
 //
 // 一个自然日算"不可用"需同时满足：
 //   1. 这一天已经结束（当天的数据不下结论）；
 //   2. 当天至少尝试了 minAttempts 次（流量太小没有说服力）；
 //   3. 当天一次可用结果都没有；
 //   4. 当天至少有一个别的渠道成功过。否则说明是整体故障（断网、代理挂了、DNS 异常），不能怪渠道。
-// 不可用的天数累计（不要求连续）达到 deadDays 就摘除，保留最近 keepDays 个自然日的记录。
+// 判定看"连续"：从已结束的日子里按时间顺序走一遍，任何一个有成功结果的日子都会把计数清零，
+// 样本不足的日子和整体故障的日子不下结论（既不计数也不清零）。
+// 连续不可用的天数达到 deadDays 就摘除，保留最近 keepDays 个自然日的记录。
+//
+// 摘除不是终点：每隔 probeIntervalMs 放行一次试探（claimProbe），把渠道放回一轮正常解析里跑一次，
+// 产出可用结果就复活（recordProbe），否则继续等下一个间隔。probeIntervalMs 为 0 表示不试探。
 export function createChannelHealth({
   file = "",
   now = Date.now,
@@ -64,6 +70,7 @@ export function createChannelHealth({
   deadDays = 3,
   minAttempts = 3,
   keepDays = KEEP_DAYS,
+  probeIntervalMs = 6 * 3_600_000,
   logger = { info() {}, warn() {} },
 } = {}) {
   const dayKey = createDayKey(timeZone);
@@ -125,14 +132,21 @@ export function createChannelHealth({
     return !Object.values(state.channels).some((entry) => (entry.days[day]?.successes || 0) > 0);
   }
 
+  // 当前连续不可用的自然日（升序）。
   function unavailableDays(id) {
     const today = dayKey(now());
     const days = state.channels[id]?.days || {};
-    return Object.entries(days)
-      .filter(([day, bucket]) =>
-        day < today && bucket.attempts >= minAttempts && bucket.successes === 0 && !wholeOutage(day))
-      .map(([day]) => day)
-      .sort();
+    let streak = [];
+    for (const day of Object.keys(days).sort()) {
+      const bucket = days[day];
+      if (day >= today || wholeOutage(day)) continue;
+      if (bucket.successes > 0) {
+        streak = [];
+      } else if (bucket.attempts >= minAttempts) {
+        streak.push(day);
+      }
+    }
+    return streak;
   }
 
   // 返回本次新摘除的渠道。
@@ -148,7 +162,7 @@ export function createChannelHealth({
         at: new Date(now()).toISOString(),
         day: today,
         endpoint: entry.endpoint || "",
-        reason: `累计 ${days.length} 个自然日不可用`,
+        reason: `连续 ${days.length} 个自然日不可用`,
         unavailableDays: days,
       };
       removedNow.push({ id, ...entry.removed });
@@ -181,6 +195,36 @@ export function createChannelHealth({
       entry.endpoint = endpoint;
       markDirty();
     },
+    // 摘除后的试探：距上一次试探（或摘除）满 probeIntervalMs 才放行，放行即占位，
+    // 同一时刻的多个解析会话不会重复试探。
+    claimProbe(id) {
+      const removed = state.channels[id]?.removed;
+      if (!removed || !probeIntervalMs) return false;
+      const last = Number.isFinite(removed.probedAt) ? removed.probedAt : Date.parse(removed.at) || 0;
+      if (now() - last < probeIntervalMs) return false;
+      removed.probedAt = now();
+      markDirty();
+      return true;
+    },
+    // 试探结果。成功就复活并重新累计；失败只记次数，等下一个间隔。
+    recordProbe(id, ok) {
+      const entry = state.channels[id];
+      if (!entry?.removed) return false;
+      if (!ok) {
+        entry.removed.probeFailures = (entry.removed.probeFailures || 0) + 1;
+        markDirty();
+        logger.info("channel.probe_failed", { provider: id, failures: entry.removed.probeFailures });
+        return false;
+      }
+      state.channels[id] = {
+        days: {},
+        ...(entry.endpoint ? { endpoint: entry.endpoint } : {}),
+        ...(entry.revision ? { revision: entry.revision } : {}),
+      };
+      logger.info("channel.revived", { provider: id, reason: "probe_succeeded" });
+      markDirty();
+      return true;
+    },
     // 摘除后的复活：外部配置给了新地址，或把 revision 调大。复活后重新累计。
     revive(id, { endpoint = "", revision = 0 } = {}) {
       const entry = state.channels[id];
@@ -204,8 +248,11 @@ export function createChannelHealth({
       const today = dayKey(now());
       const days = Object.entries(entry?.days || {});
       const lastSuccessDay = days.filter(([, bucket]) => bucket.successes > 0).map(([day]) => day).sort().pop() || "";
+      const removed = entry?.removed || null;
+      const lastProbe = removed ? (Number.isFinite(removed.probedAt) ? removed.probedAt : Date.parse(removed.at) || 0) : 0;
       return {
-        removed: entry?.removed || null,
+        removed,
+        nextProbeAt: removed && probeIntervalMs ? new Date(lastProbe + probeIntervalMs).toISOString() : null,
         unavailableDays: unavailableDays(id),
         lastSuccessDay,
         today: entry?.days?.[today] || { attempts: 0, successes: 0 },

@@ -27,6 +27,8 @@ export const config = {
   enableBrowserProvider: process.env.VERCEL
     ? process.env.ENABLE_BROWSER_PROVIDER === "true"
     : process.env.ENABLE_BROWSER_PROVIDER !== "false",
+  // 备用无头嗅探入口，产出与 jx-browser 不同的 CDN，用于互为备份。
+  browserTxnpEndpoint: process.env.BROWSER_TXNP_ENDPOINT || "https://bfq.txnp.cn/player?url=",
   httpProviderIds: process.env.HTTP_PROVIDER_IDS === undefined
     ? null
     : process.env.HTTP_PROVIDER_IDS

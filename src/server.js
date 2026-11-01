@@ -273,7 +273,10 @@ export function createServer({
   probeHost = (host, options) => lookupPublicMediaDns.probe(host, options),
   channelRegistry = null,
 } = {}) {
-  const registry = channelRegistry ?? createChannelRegistry({ builtins: httpChannels });
+  const registry = channelRegistry ?? createChannelRegistry({
+    builtins: httpChannels,
+    builtinBrowsers: builtinBrowserChannels(),
+  });
   const parseCache = new Map();
   const danmakuCache = new Map();
   const providerCooldowns = new Map();
@@ -347,6 +350,9 @@ export function createServer({
       });
     }
     if (config.enableBrowserProvider && resolveBrowser) {
+      // 内置与外部配置的 browser 渠道统一调度；两者都带 endpoint，
+      // jx-browser 走 jx.1ljx.com（产出 png.ruyijx.com），
+      // 备用入口走 bfq.txnp.cn（产出 vv.iisfu.top），不同 CDN 可互为备份。
       for (const b of registry.browserChannels()) {
         resolvers.push({
           id: b.id,
@@ -955,11 +961,20 @@ export function createServer({
     });
   }
 
+  function verifyDevPassword(req, body) {
+    const headerPwd = typeof req.headers["x-dev-password"] === "string"
+      ? req.headers["x-dev-password"].trim()
+      : "";
+    const bodyPwd = typeof body?.password === "string" ? body.password.trim() : "";
+    const provided = headerPwd || bodyPwd;
+    return provided === (config.devPassword || "adminysdev");
+  }
+
   async function handleChannels(req, res) {
     if (req.method === "GET") {
       sendJson(res, 200, {
         ok: true,
-        data: registry.status(["jiexi789", "jx-browser"]),
+        data: registry.status(["jiexi789", "jx-browser", "jx-browser-txnp"]),
       });
       return;
     }
@@ -970,6 +985,13 @@ export function createServer({
         body = JSON.parse(raw);
       } catch {
         throw new AppError("BAD_REQUEST", 400, "无效的 JSON 请求体");
+      }
+      if (!verifyDevPassword(req, body)) {
+        sendJson(res, 401, {
+          ok: false,
+          error: { code: "UNAUTHORIZED", message: "未授权：需要管理员密码" },
+        });
+        return;
       }
       const result = registry.applyRemote(body);
       registry.flush();
@@ -982,7 +1004,7 @@ export function createServer({
         data: {
           accepted: result.accepted,
           rejected: result.rejected,
-          status: registry.status(["jiexi789", "jx-browser"]),
+          status: registry.status(["jiexi789", "jx-browser", "jx-browser-txnp"]),
         },
       });
       return;
@@ -1026,13 +1048,20 @@ export function createServer({
           sendMethodNotAllowed(res, "POST");
           return;
         }
+        if (!verifyDevPassword(req)) {
+          sendJson(res, 401, {
+            ok: false,
+            error: { code: "UNAUTHORIZED", message: "未授权：需要管理员密码" },
+          });
+          return;
+        }
         const refreshed = await registry.refresh();
         registry.flush();
         sendJson(res, 200, {
           ok: true,
           data: {
             refreshed,
-            status: registry.status(["jiexi789", "jx-browser"]),
+            status: registry.status(["jiexi789", "jx-browser", "jx-browser-txnp"]),
           },
         });
         return;
@@ -1169,6 +1198,19 @@ export function createServer({
   });
 }
 
+// 内置无头嗅探渠道。jx-browser 的解析站与其产出的 CDN
+// （jx.1ljx.com → png.ruyijx.com）会整体性间歇失效，而 qilin/lx
+// 也共用同一个 png.ruyijx.com，多个渠道一起挂时无处可换。
+// txnp 走另一套 CDN（bfq.txnp.cn → vv.iisfu.top），两者互为备份。
+export function builtinBrowserChannels() {
+  if (!config.enableBrowserProvider) return [];
+  return [{
+    id: "jx-browser-txnp",
+    name: "TXNP嗅探源",
+    endpoint: config.browserTxnpEndpoint,
+  }];
+}
+
 export function createProductionRegistry() {
   const health = createChannelHealth({
     file: config.channelStateFile,
@@ -1180,6 +1222,7 @@ export function createProductionRegistry() {
   health.evaluate();
   return createChannelRegistry({
     builtins: enabledHttpChannels(config.httpProviderIds),
+    builtinBrowsers: builtinBrowserChannels(),
     health,
     remoteUrl: config.channelConfigUrl,
     refreshMs: config.channelConfigRefreshMs,

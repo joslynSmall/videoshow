@@ -114,7 +114,25 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   const channelFormTip = document.querySelector("#channel-form-tip");
 
   const DEV_AUTH_SESSION_KEY = "videoshow_dev_authed_v1";
+  const DEV_AUTH_PWD_KEY = "videoshow_dev_pwd_v1";
   const DEFAULT_DEV_PASSWORD = "adminysdev";
+
+  function getDevPassword() {
+    try {
+      return sessionStorage.getItem(DEV_AUTH_PWD_KEY) || DEFAULT_DEV_PASSWORD;
+    } catch {
+      return DEFAULT_DEV_PASSWORD;
+    }
+  }
+
+  function escapeHtml(raw) {
+    return String(raw ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
 
   const devlogList = document.querySelector("#devlog-list");
   const devlogCount = document.querySelector("#devlog-count");
@@ -253,7 +271,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     if (verified) {
       devConsoleAuthed = true;
-      try { sessionStorage.setItem(DEV_AUTH_SESSION_KEY, "1"); } catch {}
+      try {
+        sessionStorage.setItem(DEV_AUTH_SESSION_KEY, "1");
+        sessionStorage.setItem(DEV_AUTH_PWD_KEY, pwd);
+      } catch {}
       devAuthError.hidden = true;
       devAuthGate.hidden = true;
       devConsoleBody.hidden = false;
@@ -329,19 +350,19 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           <div class="channel-item-row">
             <div class="channel-item-main">
               <div class="channel-item-title">
-                <span>${c.name}</span>
-                <span class="channel-type-badge">${c.id}</span>
+                <span>${escapeHtml(c.name)}</span>
+                <span class="channel-type-badge">${escapeHtml(c.id)}</span>
                 <span class="channel-state-badge ${stateClass}">${stateText}</span>
               </div>
               <div class="channel-item-endpoint">
-                今日调用: ${c.today?.attempts || 0}次 (成功 ${c.today?.successes || 0}次) · 不可用自然日: ${unavailDays} ${c.reason ? `· 原因: ${c.reason}` : ""}
+                今日调用: ${c.today?.attempts || 0}次 (成功 ${c.today?.successes || 0}次) · 不可用自然日: ${escapeHtml(unavailDays)} ${c.reason ? `· 原因: ${escapeHtml(c.reason)}` : ""}
               </div>
             </div>
           </div>
         `;
       }).join("");
     } catch (err) {
-      devHealthList.innerHTML = `<p class="status error">加载失败: ${err instanceof Error ? err.message : String(err)}</p>`;
+      devHealthList.innerHTML = `<p class="status error">加载失败: ${escapeHtml(err instanceof Error ? err.message : String(err))}</p>`;
     }
   }
 
@@ -351,7 +372,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     devSyncRemoteBtn.disabled = true;
     devSyncRemoteBtn.textContent = "同步中…";
     try {
-      const res = await fetch("/api/channels/sync", { method: "POST" });
+      const res = await fetch("/api/channels/sync", {
+        method: "POST",
+        headers: { "x-dev-password": getDevPassword() },
+      });
       const json = await res.json();
       if (!json?.ok) throw new Error(json?.error?.message || "同步失败");
       await renderHealthTab();
@@ -378,19 +402,24 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       devChannelItems.innerHTML = channels.map(c => {
         const stateClass = c.state === "active" ? "is-active" : c.state === "removed" ? "is-removed" : "is-disabled";
         const stateText = c.state === "active" ? "启用中" : c.state === "removed" ? "已熔断" : "已停用";
+        const safeId = escapeHtml(c.id);
         return `
-          <div class="channel-item-row" data-channel-id="${c.id}">
+          <div class="channel-item-row" data-channel-id="${safeId}">
             <div class="channel-item-main">
               <div class="channel-item-title">
-                <span>${c.name}</span>
-                <span class="channel-type-badge">${c.id}</span>
+                <span>${escapeHtml(c.name)}</span>
+                <span class="channel-type-badge">${safeId}</span>
                 <span class="channel-state-badge ${stateClass}">${stateText}</span>
               </div>
             </div>
-            <div class="channel-item-actions">
+            <div class="channel-item-actions" style="display:flex;gap:6px;">
               ${c.state === "active"
-                ? `<button type="button" class="ghost-button mini-button danger-ghost channel-disable-btn" data-id="${c.id}">禁用</button>`
-                : `<button type="button" class="ghost-button mini-button channel-enable-btn" data-id="${c.id}">启用</button>`
+                ? `<button type="button" class="ghost-button mini-button danger-ghost channel-disable-btn" data-id="${safeId}">禁用</button>`
+                : `<button type="button" class="ghost-button mini-button channel-enable-btn" data-id="${safeId}">启用</button>`
+              }
+              ${c.custom
+                ? `<button type="button" class="ghost-button mini-button danger-ghost channel-delete-btn" data-id="${safeId}">删除</button>`
+                : ""
               }
             </div>
           </div>
@@ -403,8 +432,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       devChannelItems.querySelectorAll(".channel-enable-btn").forEach(btn => {
         btn.addEventListener("click", () => toggleChannel(btn.dataset.id, true));
       });
+      devChannelItems.querySelectorAll(".channel-delete-btn").forEach(btn => {
+        btn.addEventListener("click", () => deleteChannel(btn.dataset.id));
+      });
     } catch (err) {
-      devChannelItems.innerHTML = `<p class="status error">加载失败: ${err instanceof Error ? err.message : String(err)}</p>`;
+      devChannelItems.innerHTML = `<p class="status error">加载失败: ${escapeHtml(err instanceof Error ? err.message : String(err))}</p>`;
     }
   }
 
@@ -412,7 +444,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     try {
       const res = await fetch("/api/channels", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-dev-password": getDevPassword(),
+        },
         body: JSON.stringify({
           channels: [{ id: channelId, enabled: enable }]
         })
@@ -423,6 +458,27 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       renderHealthTab();
     } catch (err) {
       alert(`更新渠道状态失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function deleteChannel(channelId) {
+    try {
+      const res = await fetch("/api/channels", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-dev-password": getDevPassword(),
+        },
+        body: JSON.stringify({
+          channels: [{ id: channelId, deleted: true }]
+        })
+      });
+      const json = await res.json();
+      if (!json?.ok) throw new Error(json?.error?.message || "删除失败");
+      renderManageTab();
+      renderHealthTab();
+    } catch (err) {
+      alert(`删除渠道失败: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -439,7 +495,10 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     try {
       const res = await fetch("/api/channels", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-dev-password": getDevPassword(),
+        },
         body: JSON.stringify({
           channels: [{ id, name, type, endpoint, enabled: true }]
         })
@@ -1108,7 +1167,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         if (failed.has(item.playUrl)) continue;
         // 单次签名已明确过期的跳过
         if (Number.isFinite(item.expiresAtMs) && item.expiresAtMs <= nowMs) continue;
-        // 若该域名已连续失败 >= 2 次，跳过以避免在相同挂掉的 CDN 域名上轮训
+        // 该域名已判定不可达就直接排除：多个解析渠道常共用同一个 CDN
+        // （如 qilin 与 lx 都指向 png.ruyijx.com），该 CDN 一旦整体失效，
+        // 换到同域名的另一条线路只是重复踩同一个坑。
         const h = hostOf(item.playUrl);
         if (h && (hostFails.get(h) || 0) >= 2) continue;
         return item;
@@ -1188,6 +1249,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           data.type = chosen.type;
           data.provider = chosen.provider;
           data.failedPlayUrls = [...failed].filter((url) => url !== chosen.playUrl);
+          // 换线成功也会提前 return，域名失败计数必须在这里落盘，
+          // 否则下一轮换线拿不到已排除的域名，会重复踩同一个失效 CDN。
+          data.failedHostCounts = Object.fromEntries(hostFails);
           if (currentMedia) {
             currentMedia.playUrl = chosen.playUrl;
             currentMedia.type = chosen.type;

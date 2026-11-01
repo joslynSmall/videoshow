@@ -997,7 +997,12 @@ test("a late channel never leaks into a newer forced parse", async (t) => {
   const { base } = await start(t, {
     parseGraceMs: 10,
     resolve: async () => fakeResult({ provider: "primary", playUrl: PRIMARY }),
-    resolveBrowser: async () => {
+    resolveBrowser: async (...args) => {
+      const options = args[2] || {};
+      // 只统计 jx-browser：备用嗅探入口是另一个渠道，不参与本用例的时序。
+      if (options.provider && options.provider !== "jx-browser") {
+        throw new AppError("PARSE_FAILED", 502, "not used in this test");
+      }
       calls += 1;
       const call = calls;
       await sleep(call === 1 ? 150 : 350);
@@ -1243,12 +1248,25 @@ test("local environment failures and cooldown skips are not counted against a ch
   assert.equal(health.status("jiexi789").today.successes, 0);
 });
 
-test("POST /api/channels updates channels dynamically and triggers rebuild", async (t) => {
+test("POST /api/channels requires dev password and incrementally upserts/deletes channels", async (t) => {
   const { base } = await start(t);
+
+  const unauth = await getJson(`${base}/api/channels`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ channels: [] }),
+  });
+  assert.equal(unauth.response.status, 401);
+  assert.equal(unauth.body.ok, false);
+
+  const authHeaders = {
+    "content-type": "application/json",
+    "x-dev-password": "adminysdev",
+  };
 
   const update = await getJson(`${base}/api/channels`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authHeaders,
     body: JSON.stringify({
       channels: [
         {
@@ -1272,13 +1290,45 @@ test("POST /api/channels updates channels dynamically and triggers rebuild", asy
   assert.equal(update.body.data.accepted.length, 2);
   assert.equal(update.body.data.rejected.length, 0);
 
-  const status = await getJson(`${base}/api/channels`);
-  const foundBrowser = status.body.data.channels.find((c) => c.id === "custom-browser");
-  const foundHttp = status.body.data.channels.find((c) => c.id === "custom-http");
-  assert.ok(foundBrowser, "动态添加的 browser 渠道应在 channels 列表中");
-  assert.equal(foundBrowser.name, "自定义嗅探源");
-  assert.equal(foundBrowser.state, "active");
-  assert.ok(foundHttp, "动态添加的 http-api 渠道应在 channels 列表中");
-  assert.equal(foundHttp.state, "active");
+  // 单独禁用其中一个渠道，不应冲掉另一个自定义渠道，且保留原名称与配置。
+  await getJson(`${base}/api/channels`, {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({
+      channels: [{ id: "custom-browser", enabled: false }],
+    }),
+  });
+
+  let status = await getJson(`${base}/api/channels`);
+  let foundBrowser = status.body.data.channels.find((c) => c.id === "custom-browser");
+  let foundHttp = status.body.data.channels.find((c) => c.id === "custom-http");
+  assert.equal(foundBrowser?.state, "disabled");
+  assert.equal(foundBrowser?.name, "自定义嗅探源");
+  assert.equal(foundHttp?.state, "active", "增量禁用不应影响其他自定义渠道");
+
+  // 再次启用自定义渠道时，即使只传 { id, enabled: true } 也能恢复原有 endpoint 与名称。
+  await getJson(`${base}/api/channels`, {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({
+      channels: [{ id: "custom-browser", enabled: true }],
+    }),
+  });
+  status = await getJson(`${base}/api/channels`);
+  foundBrowser = status.body.data.channels.find((c) => c.id === "custom-browser");
+  assert.equal(foundBrowser?.state, "active");
+  assert.equal(foundBrowser?.name, "自定义嗅探源");
+  assert.equal(foundBrowser?.custom, true);
+
+  // 删除自定义渠道后应从列表移除。
+  await getJson(`${base}/api/channels`, {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({
+      channels: [{ id: "custom-browser", deleted: true }],
+    }),
+  });
+  status = await getJson(`${base}/api/channels`);
+  assert.equal(status.body.data.channels.some((c) => c.id === "custom-browser"), false);
 });
 

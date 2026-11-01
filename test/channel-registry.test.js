@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { createChannelHealth } from "../src/channels/health.js";
 import {
@@ -208,3 +211,28 @@ test("removed channels leave the registry and come back when the config gives a 
   assert.equal(ids(registry).includes("lx"), true, "给了新地址就重新启用");
   assert.equal(registry.httpChannels().find((item) => item.id === "lx").endpoint, endpoint);
 });
+
+test("manual channel overrides persist across restarts via health state file", (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vs-reg-test-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateFile = path.join(tmpDir, "channel-state.json");
+
+  const health1 = createChannelHealth({ file: stateFile, timeZone: "UTC" });
+  const registry1 = createChannelRegistry({ builtins: HTTP_CHANNELS, health: health1 });
+  registry1.applyRemote({
+    channels: [
+      { id: "persisted-browser", name: "持久化嗅探源", type: "browser", endpoint: "https://bfq.example.com/player?url=" },
+      { id: "lx", enabled: false },
+    ],
+  });
+  registry1.flush();
+
+  const health2 = createChannelHealth({ file: stateFile, timeZone: "UTC" });
+  const registry2 = createChannelRegistry({ builtins: HTTP_CHANNELS, health: health2 });
+  assert.equal(registry2.isActive("lx"), false, "重启后禁用状态仍生效");
+  const browsers = registry2.browserChannels();
+  assert.equal(browsers.length, 1);
+  assert.equal(browsers[0].id, "persisted-browser");
+  assert.equal(browsers[0].name, "持久化嗅探源");
+});
+

@@ -85,7 +85,7 @@ export function parseRemoteChannels(payload) {
       }
       entry.endpoint = raw.endpoint;
     }
-    for (const flag of ["singleUse", "fallback"]) {
+    for (const flag of ["singleUse", "fallback", "deleted"]) {
       if (raw[flag] !== undefined) entry[flag] = raw[flag] === true;
     }
     accepted.push(entry);
@@ -118,6 +118,7 @@ async function readBoundedJson(response) {
 // 外部配置拉取失败时沿用上一次成功的结果，从没成功过就只用内置渠道。
 export function createChannelRegistry({
   builtins = [],
+  builtinBrowsers = [],
   health = null,
   remoteUrl = "",
   refreshMs = 600_000,
@@ -126,29 +127,51 @@ export function createChannelRegistry({
   logger = { info() {}, warn() {} },
 } = {}) {
   const base = new Map(builtins.map((channel) => [channel.id, channel]));
-  const remote = { fetchedAt: 0, nextAttemptAt: 0, ok: null, error: "", total: 0, rejected: [], entries: [] };
+  const baseBrowsers = new Map(builtinBrowsers.map((channel) => [channel.id, channel]));
+  const savedOverrides = health?.overrides?.() ?? [];
+  const initialEntries = savedOverrides.length
+    ? parseRemoteChannels(savedOverrides).accepted.filter((item) => !item.deleted)
+    : [];
+  const remote = {
+    fetchedAt: 0,
+    nextAttemptAt: 0,
+    ok: null,
+    error: "",
+    total: initialEntries.length,
+    rejected: [],
+    entries: initialEntries,
+  };
   let active = [...base.values()];
-  let browserChannels = [];
+  let browserChannels = [...baseBrowsers.values()];
   let inflight = null;
 
   function rebuild() {
     const channels = new Map(base);
-    const browsers = [];
+    const browsers = new Map([...baseBrowsers.values()].map((b) => [b.id, { ...b }]));
     const disabled = new Set();
     for (const entry of remote.entries) {
       if (!entry.enabled) {
         disabled.add(entry.id);
         continue;
       }
-      if (entry.type === "browser") {
-        browsers.push({
+      const builtinBrowser = baseBrowsers.get(entry.id);
+      if (entry.type === "browser" || builtinBrowser) {
+        const endpoint = entry.endpoint ?? builtinBrowser?.endpoint;
+        if (!endpoint) {
+          logger.warn("channel.config_skipped", { provider: entry.id, message: "新渠道必须提供 endpoint" });
+          continue;
+        }
+        browsers.set(entry.id, {
           id: entry.id,
-          name: entry.name ?? entry.id,
-          endpoint: entry.endpoint,
+          name: entry.name ?? builtinBrowser?.name ?? entry.id,
+          endpoint,
         });
         continue;
       }
       const builtin = base.get(entry.id);
+      if (!builtin && !entry.endpoint && (entry.id === "jiexi789" || entry.id === "jx-browser")) {
+        continue;
+      }
       const spec = {
         id: entry.id,
         name: entry.name ?? builtin?.name ?? entry.id,
@@ -166,17 +189,20 @@ export function createChannelRegistry({
         spec.fallback === (builtin.fallback === true);
       channels.set(entry.id, unchanged ? builtin : createHttpChannel(spec));
     }
-    for (const id of disabled) channels.delete(id);
+    for (const id of disabled) {
+      channels.delete(id);
+      browsers.delete(id);
+    }
     for (const channel of channels.values()) health?.setEndpoint(channel.id, channel.endpoint);
-    for (const browser of browsers) health?.setEndpoint(browser.id, browser.endpoint);
+    for (const browser of browsers.values()) health?.setEndpoint(browser.id, browser.endpoint);
     for (const entry of remote.entries) {
-      if (entry.enabled && (channels.has(entry.id) || browsers.some((b) => b.id === entry.id))) {
-        const ep = channels.get(entry.id)?.endpoint || browsers.find((b) => b.id === entry.id)?.endpoint;
+      if (entry.enabled && (channels.has(entry.id) || browsers.has(entry.id))) {
+        const ep = channels.get(entry.id)?.endpoint || browsers.get(entry.id)?.endpoint;
         health?.revive(entry.id, { endpoint: ep, revision: entry.revision ?? 0 });
       }
     }
     active = [...channels.values()];
-    browserChannels = browsers;
+    browserChannels = [...browsers.values()];
     remote.disabled = disabled;
   }
 
@@ -236,12 +262,25 @@ export function createChannelRegistry({
     },
     applyRemote(payload) {
       const { accepted, rejected } = parseRemoteChannels(payload);
-      remote.entries = accepted;
+      const byId = new Map(remote.entries.map((item) => [item.id, item]));
+      for (const patch of accepted) {
+        if (patch.deleted) {
+          byId.delete(patch.id);
+          if (!base.has(patch.id) && !baseBrowsers.has(patch.id)) {
+            health?.forget?.(patch.id);
+          }
+          continue;
+        }
+        const prev = byId.get(patch.id);
+        byId.set(patch.id, prev ? { ...prev, ...patch } : patch);
+      }
+      remote.entries = [...byId.values()];
       remote.rejected = rejected;
-      remote.total = accepted.length;
+      remote.total = remote.entries.length;
       remote.ok = true;
       remote.error = "";
       remote.fetchedAt = now();
+      health?.setOverrides?.(remote.entries);
       rebuild();
       return { accepted, rejected };
     },
@@ -254,13 +293,20 @@ export function createChannelRegistry({
         ...extraIds,
       ])];
       const channels = ids.map((id) => {
-        const channel = active.find((item) => item.id === id) ?? browserChannels.find((b) => b.id === id) ?? base.get(id);
+        const channel =
+          active.find((item) => item.id === id) ??
+          browserChannels.find((b) => b.id === id) ??
+          base.get(id) ??
+          baseBrowsers.get(id) ??
+          remote.entries.find((e) => e.id === id);
         const detail = health?.status(id);
         const disabled = Boolean(remote.disabled?.has(id));
+        const custom = !base.has(id) && !baseBrowsers.has(id) && !extraIds.includes(id);
         return {
           id,
           name: channel?.name || id,
           state: detail?.removed ? "removed" : disabled ? "disabled" : "active",
+          custom,
           unavailableDays: detail?.unavailableDays ?? [],
           lastSuccessDay: detail?.lastSuccessDay || null,
           today: detail?.today ?? { attempts: 0, successes: 0 },

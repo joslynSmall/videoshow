@@ -16,7 +16,7 @@ export function createDayKey(timeZone = "") {
 }
 
 function emptyState() {
-  return { version: 1, channels: {} };
+  return { version: 1, channels: {}, overrides: [] };
 }
 
 function sanitize(raw) {
@@ -24,6 +24,11 @@ function sanitize(raw) {
     return emptyState();
   }
   const state = emptyState();
+  if (Array.isArray(raw.overrides)) {
+    state.overrides = raw.overrides.filter(
+      (item) => item && typeof item === "object" && typeof item.id === "string",
+    );
+  }
   for (const [id, channel] of Object.entries(raw.channels)) {
     if (!channel || typeof channel !== "object") continue;
     const days = {};
@@ -208,6 +213,19 @@ export function createChannelHealth({
     },
     ids() {
       return Object.keys(state.channels);
+    },
+    overrides() {
+      return Array.isArray(state.overrides) ? state.overrides : [];
+    },
+    setOverrides(entries) {
+      state.overrides = Array.isArray(entries) ? entries : [];
+      markDirty();
+    },
+    forget(id) {
+      if (state.channels[id]) {
+        delete state.channels[id];
+        markDirty();
+      }
     },
     flush() {
       if (timer) clearTimeout(timer);

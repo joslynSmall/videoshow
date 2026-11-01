@@ -6,6 +6,9 @@ import { chromeBin, chromeDataDir, chromeProxyArgs, killChrome, removeChromeDir 
 
 const PLAYER_ENDPOINT = "https://jiexi.bot.cd/jx/?url=";
 const FINAL_HOST = "123.129.229.14:4433";
+// 冰豆页面里可能混入广告位的 <video> 标签，其 currentSrc 指向图片 CDN
+// （如 p6-faceu-img-sign.byteimg.com）。这类地址不是视频流，必须排除。
+const MEDIA_URL = /\.(m3u8|mp4)(\?|$)/i;
 
 function openWebSocket(url) {
   return new Promise((resolve, reject) => {
@@ -136,18 +139,22 @@ export async function resolveBingdouWithBrowser(sourceUrl, { timeoutMs = 30000 }
     let video = null;
     while (Date.now() - started < timeoutMs) {
       video = await evaluate(pageSend, `(() => {
-        const video = document.querySelector("video");
-        if (!video) return null;
-        video.muted = true;
-        if (video.paused) video.play().catch(() => {});
-        return {
-          src: video.currentSrc || video.src || "",
-          readyState: video.readyState,
-          duration: video.duration,
-          width: video.videoWidth,
-          height: video.videoHeight,
-          error: video.error ? { code: video.error.code, message: video.error.message } : null,
-        };
+        const videos = [...document.querySelectorAll("video")];
+        for (const video of videos) {
+          const src = video.currentSrc || video.src || "";
+          if (!${JSON.stringify(MEDIA_URL.source)}.test(src)) continue;
+          video.muted = true;
+          if (video.paused) video.play().catch(() => {});
+          return {
+            src,
+            readyState: video.readyState,
+            duration: video.duration,
+            width: video.videoWidth,
+            height: video.videoHeight,
+            error: video.error ? { code: video.error.code, message: video.error.message } : null,
+          };
+        }
+        return null;
       })()`).catch(() => null);
       if (video?.src && Number.isFinite(video.duration) && video.duration > 0 &&
           video.readyState >= 2 && !video.error) {
@@ -161,7 +168,9 @@ export async function resolveBingdouWithBrowser(sourceUrl, { timeoutMs = 30000 }
     }
     return {
       playUrl: video.src,
-      type: "mp4",
+      // 类型按实际地址推断：冰豆既可能给出 m3u8 也可能给出 mp4，
+      // 之前一律标成 mp4，会让服务端用 MP4 的 range 探针去校验 HLS 清单。
+      type: /\.m3u8(\?|$)/i.test(video.src) ? "m3u8" : "mp4",
       width: video.width,
       height: video.height,
       duration: video.duration,

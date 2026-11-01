@@ -406,10 +406,10 @@ export function createServer({
         resolvedCount += 1;
         const type = normalizeType(result.type, result.playUrl);
         if (result.singleUse) {
-          // 单次链接不能预先请求分片（会消耗签名），但播放清单本身可以安全读取：
-          // 清单是纯文本，取它不会让签名失效，却能挡掉「域名存活但清单已失效」的情况。
-          // 只查 DNS 是不够的——生产上出现过 png.ruyijx.com 域名正常、清单 404，
-          // 结果该链接被选为首选，前端起播立刻 manifestLoadError。
+          // 单次签名链接不能预先请求：任何一次 GET 都会消耗签名，
+          // 服务端校验过之后客户端再取就会 404（实测 png.ruyijx.com 首次 200、
+          // 校验后立即 404）。所以这里只查 DNS：域名不存在就不必等起播超时。
+          // 清单是否可读只能由客户端在真正播放时判断。
           if ((await hostHealth(result.playUrl)) === "dead") {
             finish("rejected", {
               code: "HOST_UNREACHABLE",
@@ -420,22 +420,6 @@ export function createServer({
               provider: item.id,
               message: "媒体域名已失效",
               detail: { host: hostOf(result.playUrl) },
-            });
-            return null;
-          }
-          try {
-            await guardMedia(result.playUrl);
-            await validate(result.playUrl, type);
-          } catch (err) {
-            finish("rejected", {
-              code: err?.code || "STREAM_INVALID",
-              message: err?.message || "单次链接不可用",
-              playHost: hostOf(result.playUrl),
-            });
-            logger.warn("stream.rejected", {
-              provider: item.id,
-              message: "单次链接校验未通过",
-              detail: { host: hostOf(result.playUrl), code: err?.code },
             });
             return null;
           }

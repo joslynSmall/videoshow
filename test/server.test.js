@@ -140,9 +140,9 @@ test("qilin API success becomes a single-use fallback without server media reads
   assert.equal(response.status, 200);
   assert.equal(body.data.provider, "test");
   assert.equal(requests, 2);
-  // 单次链接只校验播放清单本身（不取分片），避免消耗签名；
-  // 同时清单不可达时必须被拒掉，不能作为首选线路。
-  assert.equal(validated.includes(media), true);
+  // 单次签名链接绝不能被服务端预先请求：任何一次 GET 都会消耗签名，
+  // 服务端校验过之后客户端再取必然 404。
+  assert.equal(validated.includes(media), false);
   assert.deepEqual(raced, ["test"]);
   const qilin = body.data.candidates.find((item) => item.provider === "qilin");
   assert.equal(qilin.singleUse, true);
@@ -477,58 +477,9 @@ test("verified stream is preferred over an unvalidated single-use link", async (
   assert.equal(singleUse.selected, false);
 });
 
-// 回归：清单不可达的 single-use 链接必须被拒掉。
-// 生产事故：png.ruyijx.com 域名存活但播放清单已失效，
-// 该链接仍被标为 available 并选为首选，前端起播立刻 manifestLoadError。
-test("single-use link with an unreachable playlist is rejected", async (t) => {
-  const qilin = HTTP_CHANNELS.find((item) => item.id === "qilin");
-  const { base } = await start(t, {
-    resolve: async () => { throw new AppError("PARSE_FAILED", 502, "no upstream"); },
-    resolveBrowser: async () => fakeResult({
-      playUrl: "https://media.example/verified.m3u8",
-      provider: "jx-browser",
-    }),
-    httpChannels: [qilin],
-    resolveHttp: async () => ({
-      sourceUrl: SAMPLE,
-      playUrl: "https://media.example/broken.m3u8",
-      type: "m3u8",
-      provider: "qilin",
-      singleUse: true,
-      expiresAtMs: Date.now() + 60_000,
-    }),
-    validate: async (url) => {
-      if (url.includes("broken.m3u8")) {
-        throw new AppError("STREAM_INVALID", 502, "播放清单不可访问");
-      }
-      return { playlist: "#EXTM3U" };
-    },
-    race: async (candidates) => ({
-      winner: candidates[0] || null,
-      ranked: candidates.map((item, index) => ({
-        provider: item.provider,
-        playUrl: item.playUrl,
-        type: item.type,
-        available: true,
-        selected: index === 0,
-      })),
-    }),
-  });
-
-  const { response, body } = await getJson(`${base}/api/parse?url=${encodeURIComponent(SAMPLE)}`);
-  assert.equal(response.status, 200);
-  // 失效的单次链接不得出现在候选里，更不能被选中。
-  assert.equal(
-    body.data.candidates.some((item) => item.playUrl?.includes("broken.m3u8")),
-    false,
-  );
-  assert.equal(body.data.provider, "jx-browser");
-  const qilinDiag = body.data.diagnostics.find((item) => item.provider === "qilin");
-  assert.equal(qilinDiag?.status, "rejected");
-});
-
 test("GET /api/parse races multiple providers and selects the faster stream", async (t) => {
-  const { base } = await start(t, {    resolve: async () => ({
+  const { base } = await start(t, {
+    resolve: async () => ({
       sourceUrl: SAMPLE,
       playUrl: "https://slow.com/video.m3u8",
       type: "m3u8",

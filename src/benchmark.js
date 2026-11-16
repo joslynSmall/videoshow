@@ -1,5 +1,6 @@
 import { AppError } from "./errors.js";
 import { fetchPublicMedia } from "./media.js";
+import { segmentHosts, segmentUrls } from "./playlist.js";
 
 const DEFAULT_BENCHMARK_TIMEOUT_MS = 4000;
 const MAX_SAMPLE_BYTES = 512 * 1024;
@@ -45,6 +46,25 @@ export function extractFirstSegmentUrl(m3u8Text, m3u8Url) {
   return null;
 }
 
+// 聚合播放列表常在片头拼接外域广告块（由 #EXT-X-DISCONTINUITY 分隔）。
+// 测速时优先取主 CDN 域名的首个分片，避免把广告服务器速度当成正片线路速度。
+export function extractProbeSegmentUrl(m3u8Text, m3u8Url) {
+  if (/#EXT-X-DISCONTINUITY/i.test(m3u8Text) && !/#EXT-X-STREAM-INF/i.test(m3u8Text)) {
+    const dominantHost = segmentHosts(m3u8Text, m3u8Url, 1)[0];
+    if (dominantHost) {
+      const match = segmentUrls(m3u8Text, m3u8Url).find((url) => {
+        try {
+          return new URL(url).host === dominantHost;
+        } catch {
+          return false;
+        }
+      });
+      if (match) return match;
+    }
+  }
+  return extractFirstSegmentUrl(m3u8Text, m3u8Url);
+}
+
 // 服务端测速没跑完不等于播不了：超时、网络错误、服务端 DNS 校验被拦（例如 Fake-IP 环境）
 // 都只说明"这次没测成"，浏览器是直接取分片的。只有 HTTP 状态码、内容类型这类明确的内容问题才算不可用。
 function isInconclusiveFailure(err) {
@@ -74,7 +94,7 @@ export async function benchmarkStream(playUrl, type, options = {}) {
         const playlist = prefetched ?? await fetchPlaylist(targetProbeUrl, controller.signal);
         prefetched = null;
         if (!playlist.trimStart().startsWith("#EXTM3U")) throw new Error("invalid playlist");
-        const first = extractFirstSegmentUrl(playlist, targetProbeUrl);
+        const first = extractProbeSegmentUrl(playlist, targetProbeUrl);
         if (!first) throw new Error("empty playlist");
         targetProbeUrl = first;
         if (!/\.m3u8(\?|$)/i.test(first)) break;

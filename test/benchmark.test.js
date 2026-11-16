@@ -4,6 +4,7 @@ import { AppError } from "../src/errors.js";
 import {
   benchmarkStream,
   extractFirstSegmentUrl,
+  extractProbeSegmentUrl,
   raceAndSelect,
   resolveSegmentUrl,
   scoreStream,
@@ -290,4 +291,23 @@ test("raceAndSelect hands each candidate's validated playlist to the benchmark",
   }], { probeSingle: true });
   assert.equal(result.winner?.provider, "snapshot-line");
   assert.deepEqual(urls, ["https://8.8.8.8/p/first.ts"]);
+});
+
+test("extractProbeSegmentUrl skips pre-roll ad blocks to probe the main video CDN", () => {
+  const playlist = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:3",
+    "#EXTINF:5.0,",
+    "https://ad.example/pre1.ts",
+    "#EXT-X-DISCONTINUITY",
+    "#EXTINF:10.0,",
+    "https://main.example/seg0.ts",
+    "#EXTINF:10.0,",
+    "https://main.example/seg1.ts",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  assert.equal(
+    extractProbeSegmentUrl(playlist, "https://play.example/index.m3u8"),
+    "https://main.example/seg0.ts",
+  );
 });

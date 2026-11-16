@@ -90,6 +90,12 @@ http://127.0.0.1:3000/?url=https%3A%2F%2Fwww.iqiyi.com%2Fv_19rronibdc.html
 HOST=0.0.0.0 PORT=3000 npm start
 ```
 
+## 生产部署
+
+生产地址：https://video.jiongka.dpdns.org（Vercel 备用：https://videoshow-six.vercel.app，仅 HTTP 渠道、无 Chrome）。
+
+部署拓扑、发布/回滚步骤与验证清单见 [docs/deployment.md](docs/deployment.md)。要点：代码只部署到 jd（`/opt/videoshow`，`systemctl restart videoshow`）；公网入口走 jd→hk 的 SSH 反向隧道 + hk nginx，不要用 frp 接 jd；旧域名 `videoshow.jiongka.online` 已随 `jiongka.online` 过期失效。
+
 ## HTTP API
 
 ### `GET /api/resolve?url=<encoded-video-url>`

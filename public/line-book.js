@@ -9,6 +9,20 @@
 
 export const STRIKE_LIMIT = 2;
 
+// 起播出帧前是否值得抢先切换到新到达的线路：
+// 只在明显更优（未校验 -> 已校验、未测速 -> 已测速、或评分达到两倍以上且绝对差值足够大）时切换，
+// 避免相近线路来回抖动。
+export function shouldPreemptLine(current, candidate) {
+  if (!current || !candidate || candidate.id === current.id) return false;
+  if (candidate.verified === false && current.verified !== false) return false;
+  if (current.verified === false && candidate.verified !== false) return true;
+  const curScore = Number.isFinite(current.score) ? current.score : 0;
+  const candScore = Number.isFinite(candidate.score) ? candidate.score : 0;
+  if (current.unmeasured && !candidate.unmeasured && candScore > 0) return true;
+  if (candidate.unmeasured) return false;
+  return candScore >= curScore * 2 && candScore - curScore >= 300;
+}
+
 // 把一次失败整理成要记的账。evidence:
 //   { kind: "manifest" | "fragment" | "startup" | "stall" | "media", status?, timeout?, host?, manifestLoaded? }
 // 返回 { strikes: [{ host, weight }] }；strikes 为空表示只排除这条线路。

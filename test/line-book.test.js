@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyFailure, createLineBook, STRIKE_LIMIT } from "../public/line-book.js";
+import { classifyFailure, createLineBook, shouldPreemptLine, STRIKE_LIMIT } from "../public/line-book.js";
 
 let counter = 0;
 function line(overrides = {}) {
@@ -148,4 +148,22 @@ test("hasUsable reflects the remaining lines", () => {
   book.fail(a, { kind: "media" });
   assert.equal(book.hasUsable(), false);
   assert.equal(book.isFailed(a), true);
+});
+
+test("shouldPreemptLine upgrades unverified, unmeasured, or clearly faster lines without thrashing", () => {
+  const unverified = line({ verified: false, score: 0 });
+  const measuredLow = line({ verified: true, score: 150 });
+  const measuredMid = line({ verified: true, score: 500 });
+  const measuredClose = line({ verified: true, score: 650 });
+  const measuredFast = line({ verified: true, score: 1200 });
+  const unmeasured = line({ verified: true, unmeasured: true, score: 0 });
+
+  assert.equal(shouldPreemptLine(unverified, measuredLow), true);
+  assert.equal(shouldPreemptLine(measuredLow, unverified), false);
+  assert.equal(shouldPreemptLine(unmeasured, measuredLow), true);
+  assert.equal(shouldPreemptLine(measuredLow, unmeasured), false);
+  assert.equal(shouldPreemptLine(measuredLow, measuredMid), true);
+  assert.equal(shouldPreemptLine(measuredMid, measuredClose), false);
+  assert.equal(shouldPreemptLine(measuredMid, measuredFast), true);
+  assert.equal(shouldPreemptLine(measuredFast, measuredFast), false);
 });

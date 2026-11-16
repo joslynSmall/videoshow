@@ -1067,7 +1067,19 @@ test("front-end script modules are served", async (t) => {
     });
     assert.equal(response.status, 200, asset);
     assert.match(response.headers.get("content-type"), /javascript/);
+    if (asset === "/app.js") {
+      const code = await response.text();
+      assert.match(code, /fullscreenWeb:\s*true/);
+      assert.match(code, /videoshow_active_playback_v1/);
+    }
   }
+  const stylesResponse = await fetch(`${base}/styles.css`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(stylesResponse.status, 200);
+  assert.match(stylesResponse.headers.get("content-type"), /text\/css/);
+  const stylesText = await stylesResponse.text();
+  assert.match(stylesText, /is-web-fullscreen/);
 });
 
 test("unknown API and static paths return 404", async (t) => {

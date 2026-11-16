@@ -78,6 +78,35 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   const PLAYBACK_RATES = [0.5, 0.8, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2, 2.5, 3];
   // 播放器上的快进/快退按钮步长，与 Artplayer 默认键盘 SEEK_STEP(5s) 区分开。
   const SEEK_BUTTON_STEP = 10;
+  // 手机端与电脑端两套播放器及弹幕配置：手机端收起画中画以保住网页全屏/全屏按钮空间，并缩小弹幕默认字号。
+  const PLAYER_PRESETS = {
+    desktop: {
+      pip: true,
+      seekIconSize: 22,
+      danmakuFontSize: 20,
+      danmakuFullscreenFontSize: 20,
+      danmakuSpeed: 7.5,
+      danmakuMargin: [10, "25%"],
+      danmakuOpacity: 1,
+      danmakuMount: undefined,
+    },
+    mobile: {
+      pip: false,
+      seekIconSize: 18,
+      danmakuFontSize: 13,
+      danmakuFullscreenFontSize: 17,
+      danmakuSpeed: 7.5,
+      danmakuMargin: [6, "25%"],
+      danmakuOpacity: 0.92,
+      danmakuMount: "#danmaku-mount",
+    },
+  };
+
+  function currentPlayerPreset() {
+    const narrow = window.matchMedia?.("(max-width: 640px)")?.matches;
+    const mobileUa = Boolean(window.Artplayer?.utils?.isMobile);
+    return narrow || mobileUa ? PLAYER_PRESETS.mobile : PLAYER_PRESETS.desktop;
+  }
   const autoplayNextInput = document.querySelector("#autoplay-next");
   const autoplayToggle = autoplayNextInput?.closest(".autoplay-toggle");
   const AUTOPLAY_NEXT_KEY = "videoshow_autoplay_next_v1";
@@ -596,13 +625,13 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   // 播放器上的快进/快退按钮。手机上没有物理键盘，默认的方向键快进不可用，
   // 所以在控制区追加两个可点按钮，每次跳转 SEEK_BUTTON_STEP 秒。
   // 使用与 Artplayer 控制栏一致的 SVG 图标与样式。
-  function seekButton(name, step, label, svgPaths, index) {
+  function seekButton(name, step, label, svgPaths, index, iconSize = 22) {
     return {
       name,
       position: "right",
       index,
       tooltip: label,
-      html: `<i class="art-icon art-icon-${name}" style="display:flex;align-items:center;justify-content:center;width:100%;height:100%"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">${svgPaths}</svg></i>`,
+      html: `<i class="art-icon art-icon-${name}" style="display:flex;align-items:center;justify-content:center;width:100%;height:100%"><svg viewBox="0 0 24 24" width="${iconSize}" height="${iconSize}" fill="currentColor">${svgPaths}</svg></i>`,
       click: () => {
         if (!art || switchingLine) return;
         const duration = Number(art.duration);
@@ -915,6 +944,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       art.destroy(false);
       art = null;
     }
+    const danmakuMountEl = document.querySelector("#danmaku-mount");
+    if (danmakuMountEl) danmakuMountEl.replaceChildren();
     document.body.classList.remove("is-web-fullscreen");
   }
 
@@ -1720,6 +1751,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       });
     };
 
+    const preset = currentPlayerPreset();
+    const danmakuMountEl = preset.danmakuMount ? document.querySelector(preset.danmakuMount) : null;
+    if (danmakuMountEl) danmakuMountEl.replaceChildren();
     window.Artplayer.PLAYBACK_RATE = PLAYBACK_RATES;
     art = new window.Artplayer({
       container: player,
@@ -1733,7 +1767,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       aspectRatio: true,
       fullscreen: true,
       fullscreenWeb: true,
-      pip: true,
+      pip: preset.pip,
       hotkey: true,
       controls: [
         seekButton(
@@ -1742,6 +1776,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           "快退10秒",
           '<path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/>',
           11,
+          preset.seekIconSize,
         ),
         seekButton(
           "seek-forward",
@@ -1749,6 +1784,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           "快进10秒",
           '<path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>',
           12,
+          preset.seekIconSize,
         ),
       ],
       autoSize: false,
@@ -1764,9 +1800,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           danmuku: () => loadDanmaku(danmakuEndpoint),
           emitter: false,
           theme: "dark",
-          fontSize: 20,
-          speed: 7.5,
-          opacity: 1,
+          fontSize: preset.danmakuFontSize,
+          speed: preset.danmakuSpeed,
+          margin: preset.danmakuMargin,
+          opacity: preset.danmakuOpacity,
+          mount: danmakuMountEl || undefined,
           antiOverlap: true,
         }),
       ],
@@ -1863,8 +1901,21 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       activeArt.hls?.destroy();
     });
 
+    const syncDanmakuPresetSize = () => {
+      if (preset.danmakuFullscreenFontSize === preset.danmakuFontSize) return;
+      const expanded = Boolean(activeArt.fullscreen || activeArt.fullscreenWeb);
+      activeArt.plugins?.artplayerPluginDanmuku?.config?.({
+        fontSize: expanded ? preset.danmakuFullscreenFontSize : preset.danmakuFontSize,
+      });
+    };
+
+    art.on("fullscreen", () => {
+      syncDanmakuPresetSize();
+    });
+
     art.on("fullscreenWeb", (state) => {
       document.body.classList.toggle("is-web-fullscreen", Boolean(state));
+      syncDanmakuPresetSize();
       devlog("网页全屏", { enabled: Boolean(state) }, "info");
     });
 

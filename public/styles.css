@@ -683,6 +683,27 @@ select {
   background: #0a0a09;
 }
 
+.danmaku-mount {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 36px;
+  padding: 0 12px;
+  background: var(--bg-deep);
+  border-top: 1px solid var(--line);
+}
+
+.danmaku-mount:empty {
+  display: none;
+}
+
+.danmaku-mount .artplayer-plugin-danmuku {
+  width: 100%;
+  height: 36px;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
 .result-body {
   display: flex;
   align-items: center;
@@ -1856,18 +1877,36 @@ select {
   }
 }
 
-/* 手机端全面响应式适配 */
+/* 手机端全面响应式适配（独立手机端字号与紧凑控件尺度） */
 @media (max-width: 640px) {
+  body {
+    font-size: 13px;
+  }
+
   .shell {
-    padding: 0 16px calc(16px + env(safe-area-inset-bottom));
+    padding: 0 12px calc(16px + env(safe-area-inset-bottom));
   }
 
   .topbar {
-    height: 56px;
+    height: 48px;
+  }
+
+  .brand-mark {
+    width: 24px;
+    height: 24px;
+  }
+
+  .brand-name {
+    font-size: 15px;
+  }
+
+  .icon-button {
+    height: 32px;
+    padding: 0 8px;
   }
 
   .hero.compact-hero {
-    padding: 16px 0 8px;
+    padding: 12px 0 8px;
   }
 
   .input-row {
@@ -1882,51 +1921,103 @@ select {
   .channel-switch {
     flex: 1 1 auto;
     min-width: 0;
+    height: 40px;
   }
 
   .channel-option {
-    padding: 0 10px;
-    font-size: 13px;
+    height: 30px;
+    padding: 0 8px;
+    font-size: 12px;
   }
 
   #url-input {
-    height: 44px;
-    font-size: 14px;
+    height: 40px;
+    font-size: 13px;
     padding: 0 36px;
   }
 
   #submit-button {
     flex: 0 0 auto;
-    height: 44px;
-    padding: 0 16px;
-    font-size: 14px;
+    height: 40px;
+    padding: 0 14px;
+    font-size: 13px;
   }
 
   .button-label {
     display: none;
   }
 
-  .icon-button {
-    padding: 0 10px;
-  }
-
   .stage-card {
     padding: 16px;
   }
 
+  .stage-kicker {
+    font-size: 11px;
+  }
+
   .stage-heading {
-    font-size: 20px;
+    font-size: 18px;
+  }
+
+  .stage-desc {
+    font-size: 13px;
+  }
+
+  .mode-title,
+  .stage-panel-title,
+  .recent-item-title {
+    font-size: 13px;
+  }
+
+  .mode-meta,
+  .recent-item-meta,
+  .recent-empty {
+    font-size: 12px;
   }
 
   .stage-intro {
     gap: 16px;
   }
 
+  /* 手机端收紧播放器底部控件宽度（提高选择器权重覆盖 Artplayer 运行时注入样式），保证快退/快进/设置/网页全屏/全屏完整显示 */
+  body .art-video-player,
+  body .art-video-player.art-mobile {
+    --art-control-height: 34px;
+    --art-padding: 8px;
+  }
+
+  body .art-video-player .art-controls .art-control {
+    min-width: 30px;
+    width: 32px;
+    padding: 0 2px;
+  }
+
+  body .art-video-player .art-controls .art-control-time {
+    width: auto;
+    min-width: auto;
+    padding: 0 4px;
+    font-size: 11px;
+  }
+
+  body .art-video-player .art-controls .art-icon {
+    width: 20px;
+    height: 20px;
+  }
+
+  body .art-video-player .art-controls .art-icon svg {
+    width: 18px;
+    height: 18px;
+  }
+
   .result-body {
     flex-direction: column;
     align-items: flex-start;
-    gap: 8px;
-    padding: 12px 16px;
+    gap: 6px;
+    padding: 12px 14px;
+  }
+
+  .result-copy h2 {
+    font-size: 14px;
   }
 
   .result-actions {
@@ -1937,6 +2028,7 @@ select {
   }
 
   .expiry {
+    font-size: 11px;
     white-space: normal;
   }
 
@@ -1944,8 +2036,34 @@ select {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .search-card-title {
+    font-size: 13px;
+  }
+
+  .search-card-remarks,
+  .search-card-desc {
+    font-size: 11px;
+  }
+
   .episodes-bar {
     padding: 12px;
+    gap: 8px;
+  }
+
+  .episodes-label {
+    font-size: 13px;
+  }
+
+  .episodes-current,
+  .autoplay-toggle {
+    font-size: 11px;
+  }
+
+  .episode-btn {
+    height: 32px;
+    min-width: 48px;
+    padding: 0 10px;
+    font-size: 12px;
   }
 
   .episodes-actions {
@@ -1953,7 +2071,7 @@ select {
   }
 
   .episodes-grid {
-    grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
     padding: 12px 16px;
     gap: 8px;
   }
@@ -1971,6 +2089,7 @@ select {
     flex-direction: column;
     gap: 4px;
     padding-top: 12px;
+    font-size: 11px;
   }
 
   /* 移动端弹窗转为底部抽屉 */

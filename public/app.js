@@ -1,6 +1,6 @@
 import { stripAdBlocks } from "/ad-filter.js";
 import { splitDanmakuText } from "/danmaku-text.js";
-import { createLineBook } from "/line-book.js";
+import { createLineBook, shouldPreemptLine } from "/line-book.js";
 import { readResolveStream } from "/resolve-stream.js";
 import { createStallMonitor } from "/stall-monitor.js";
 
@@ -30,6 +30,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
 (() => {
   const form = document.querySelector("#parse-form");
+  const brandLink = document.querySelector(".brand");
   const input = document.querySelector("#url-input");
   const clearInputBtn = document.querySelector("#clear-input-button");
   const submit = document.querySelector("#submit-button");
@@ -40,6 +41,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   const expiry = document.querySelector("#expiry");
 
   // 新增界面元素
+  const homeStage = document.querySelector("#home-stage");
+  const recentWatchList = document.querySelector("#recent-watch-list");
+  const homeOpenHistoryBtn = document.querySelector("#home-open-history");
   const historyToggleBtn = document.querySelector("#history-toggle-button");
   const historyModal = document.querySelector("#history-modal");
   const closeHistoryBtn = document.querySelector("#close-history-button");
@@ -390,7 +394,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       if (!json?.ok) throw new Error(json?.error?.message || "同步失败");
       await renderHealthTab();
       await renderManageTab();
-      alert(json.data?.refreshed ? "源头已成功同步并更新渠道！" : "源头同步完成（无配置地址或已是最新）");
+      alert(json.data?.refreshed ? "源头已同步并更新渠道" : "源头同步完成（无配置地址或已是最新）");
     } catch (err) {
       alert(`同步失败: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -518,7 +522,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         const reason = json?.data?.rejected?.[0]?.reason || json?.error?.message || "添加失败";
         throw new Error(reason);
       }
-      channelFormTip.textContent = "添加成功！";
+      channelFormTip.textContent = "添加成功";
       channelFormTip.className = "channel-form-tip is-success";
       devChannelAddForm.reset();
       renderManageTab();
@@ -546,13 +550,34 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   if (searchChannelSelect) {
+    const channelButtons = Array.from(document.querySelectorAll(".channel-option"));
+    const syncChannelButtons = (value) => {
+      for (const btn of channelButtons) {
+        const active = btn.dataset.channel === value;
+        btn.classList.toggle("is-active", active);
+        btn.setAttribute("aria-pressed", String(active));
+      }
+    };
+
     try {
       searchChannelSelect.value = localStorage.getItem(SEARCH_CHANNEL_KEY) === "sites" ? "sites" : "api";
     } catch {
       searchChannelSelect.value = "api";
     }
+    syncChannelButtons(searchChannelSelect.value);
+
+    for (const btn of channelButtons) {
+      btn.addEventListener("click", () => {
+        const next = btn.dataset.channel === "sites" ? "sites" : "api";
+        if (searchChannelSelect.value === next) return;
+        searchChannelSelect.value = next;
+        searchChannelSelect.dispatchEvent(new Event("change"));
+      });
+    }
+
     searchChannelSelect.addEventListener("change", () => {
       const channel = searchChannelSelect.value === "sites" ? "sites" : "api";
+      syncChannelButtons(channel);
       try {
         localStorage.setItem(SEARCH_CHANNEL_KEY, channel);
       } catch {}
@@ -629,9 +654,31 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
      1. 播放历史与断点持久化 Store
      ========================================================================= */
   const HISTORY_KEY = "videoshow_playback_history_v1";
+  const ACTIVE_PLAYBACK_KEY = "videoshow_active_playback_v1";
   const SEARCH_HISTORY_KEY = "videoshow_search_history_v1";
   const MAX_HISTORY_ITEMS = 50;
   const MAX_SEARCH_HISTORY = 16;
+
+  const ActivePlayback = {
+    getId() {
+      try {
+        return localStorage.getItem(ACTIVE_PLAYBACK_KEY) || "";
+      } catch {
+        return "";
+      }
+    },
+    setId(id) {
+      if (!id) return;
+      try {
+        localStorage.setItem(ACTIVE_PLAYBACK_KEY, id);
+      } catch {}
+    },
+    clear() {
+      try {
+        localStorage.removeItem(ACTIVE_PLAYBACK_KEY);
+      } catch {}
+    },
+  };
 
   const HistoryStore = {
     getAll() {
@@ -662,11 +709,21 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
             duration: previous.duration || 0,
           };
         }
-        const currentTime = Math.floor(item.currentTime || 0);
-        const duration = Math.floor(item.duration || 0);
-        progress[progressKey(item)] = { currentTime, duration };
+        const key = progressKey(item);
+        const existingSlot = progress[key];
+        const hasValidProgress = Number.isFinite(item.duration) && item.duration > 0;
+        const currentTime = hasValidProgress
+          ? Math.floor(item.currentTime || 0)
+          : (existingSlot?.currentTime || 0);
+        const duration = hasValidProgress
+          ? Math.floor(item.duration || 0)
+          : (existingSlot?.duration || 0);
+        progress[key] = { currentTime, duration };
         const record = {
           id: item.id,
+          cat: item.cat ?? previous?.cat,
+          titleId: item.titleId ?? previous?.titleId,
+          baseTitle: cleanBaseTitle(item.baseTitle || previous?.baseTitle || item.title, item.episodeName),
           title: item.title || "未知视频",
           cover: item.cover || "",
           sourceUrl: item.sourceUrl || "",
@@ -674,6 +731,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           type: item.type || "m3u8",
           episodeName: item.episodeName || "",
           episodeIndex: typeof item.episodeIndex === "number" ? item.episodeIndex : 0,
+          platforms: Array.isArray(item.platforms) ? item.platforms : (previous?.platforms || []),
+          platformId: item.platformId ?? previous?.platformId ?? "",
           currentTime,
           duration,
           episodes: Array.isArray(item.episodes) ? item.episodes : [],
@@ -700,6 +759,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       try {
         localStorage.removeItem(HISTORY_KEY);
       } catch {}
+      ActivePlayback.clear();
     },
   };
 
@@ -822,7 +882,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   function setLoading(loading, message = "") {
     submit.disabled = loading;
-    submit.textContent = loading ? "解析中…" : "解析";
+    submit.textContent = loading ? "解析中…" : "搜索 / 解析";
     form.setAttribute("aria-busy", String(loading));
     if (loadingOverlay) {
       if (loading) {
@@ -849,9 +909,13 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
   function destroyPlayer() {
     if (art) {
+      if (art.fullscreenWeb) {
+        art.fullscreenWeb = false;
+      }
       art.destroy(false);
       art = null;
     }
+    document.body.classList.remove("is-web-fullscreen");
   }
 
   // 出现误判时可在控制台执行 localStorage.setItem("videoshow.adFilter", "off") 关闭。
@@ -899,6 +963,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     }
     return { kind: "media" };
   }
+
+  const proxyRelayHosts = new Map();
+  const PROXY_RELAY_TTL_MS = 5 * 60 * 1000;
 
   function playM3u8(video, url, artInstance, onFatal, onAttached) {
     const retry = { maxNumRetry: 2, retryDelayMs: 300, maxRetryDelayMs: 1000 };
@@ -952,11 +1019,13 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
                 }
               : tracked;
             let crossOrigin = false;
+            let originalHost = "";
             try {
-              crossOrigin =
-                typeof original === "string" &&
-                /^https?:\/\//i.test(original) &&
-                new URL(original).origin !== location.origin;
+              if (typeof original === "string" && /^https?:\/\//i.test(original)) {
+                const parsed = new URL(original);
+                crossOrigin = parsed.origin !== location.origin;
+                originalHost = parsed.host;
+              }
             } catch {
               crossOrigin = false;
             }
@@ -964,6 +1033,14 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
               super.load(context, config, callbacks);
               return;
             }
+
+            const relayUntil = originalHost ? proxyRelayHosts.get(originalHost) || 0 : 0;
+            if (relayUntil > Date.now()) {
+              context.url = `${location.origin}/api/media?url=${encodeURIComponent(original)}`;
+              super.load(context, config, callbacks);
+              return;
+            }
+            if (relayUntil) proxyRelayHosts.delete(originalHost);
 
             // 浏览器到源站通常是通的。先直连，超时或失败再交给本站中转。
             let settled = false;
@@ -978,7 +1055,13 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
               context.url = `${location.origin}/api/media?url=${encodeURIComponent(original)}`;
               const next = new BaseLoader(this.loaderOptions);
               this.fallback = next;
-              next.load(context, config, callbacks);
+              next.load(context, config, {
+                ...callbacks,
+                onSuccess: (...args) => {
+                  if (originalHost) proxyRelayHosts.set(originalHost, Date.now() + PROXY_RELAY_TTL_MS);
+                  callbacks.onSuccess?.(...args);
+                },
+              });
             };
             const policy = config?.loadPolicy;
             const directConfig = policy
@@ -1090,9 +1173,13 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return payload.data.items || [];
   }
 
-  function cleanBaseTitle(title) {
+  function cleanBaseTitle(title, episodeName = "") {
     if (!title) return "视频";
-    return title.replace(/(\s+第\d+集|\s+全集|\s+正片)+/gi, "").trim() || title;
+    let cleaned = title.replace(/(\s+第\d+集|\s+全集|\s+正片)+/gi, "").trim();
+    if (episodeName && cleaned.endsWith(` ${episodeName}`)) {
+      cleaned = cleaned.slice(0, -episodeName.length - 1).trim();
+    }
+    return cleaned || title;
   }
 
   /* =========================================================================
@@ -1214,6 +1301,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     devlog("解析请求", { host: hostOf(url) }, "info");
     return new Promise((resolve, reject) => {
       let settled = false;
+      let pickScheduled = false;
       const slowTimer = window.setTimeout(() => {
         if (settled || session.closed) return;
         devlog("解析较慢", "30 秒内没有可用线路，继续等待…", "warn");
@@ -1225,9 +1313,19 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         window.clearTimeout(slowTimer);
         fn(value);
       };
-      session.onLine = (line) => {
+      const pickBestLine = () => {
+        pickScheduled = false;
+        if (settled || session.closed) return;
+        const best = session.book.next();
+        if (best) settle(resolve, buildSessionData(session, best));
+      };
+      session.onLine = () => {
         for (const wake of [...session.waiters]) wake();
-        if (!settled) settle(resolve, buildSessionData(session, line));
+        // 等同一批 SSE 数据块里的所有线路都进入 line-book 后再选最优（对实时到达的线路无额外等待）。
+        if (!settled && !pickScheduled) {
+          pickScheduled = true;
+          queueMicrotask(pickBestLine);
+        }
       };
       readResolveStream({
         url,
@@ -1240,12 +1338,22 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           // 被新的解析取代（换集、重新提交）：调用方的加载状态已经由新请求接管，
           // 这个旧请求既不成功也不报错，保持挂起即可。
           if (outcome?.aborted) return;
+          const best = session.book.next();
+          if (best) {
+            settle(resolve, buildSessionData(session, best));
+            return;
+          }
           settle(reject, new Error(session.failure?.message || "解析失败，请稍后重试。"));
         })
         .catch((err) => {
           session.ended = true;
           for (const wake of [...session.waiters]) wake();
           devlog("解析连接中断", err instanceof Error ? err.message : String(err), "error");
+          const best = session.book.next();
+          if (best) {
+            settle(resolve, buildSessionData(session, best));
+            return;
+          }
           settle(reject, err instanceof Error ? err : new Error("解析失败，请稍后重试。"));
         });
     });
@@ -1345,40 +1453,61 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     return { promise, stop: () => window.clearInterval(poll) };
   }
 
-  async function switchToSmootherSource(data, reason = "", evidence = null) {
+  async function switchToSmootherSource(data, reason = "", evidence = null, options = {}) {
     if (switchingLine || !art) {
       devlog("换线跳过", switchingLine ? "已有换线进行中" : "播放器不存在", "warn");
       return;
     }
     const instance = art;
     const session = data.session;
+    const preemptLine = options.preemptLine || null;
     const continueAt = Number.isFinite(instance.currentTime) ? instance.currentTime : 0;
     if (!session?.book) {
       setStatus("暂时播不了，请稍后再试。", "error");
       return;
     }
-    // 失败只按证据的范围记账：线路级问题只排除这一条，域名级问题才累计到域名。
-    const defaultKind = reason === "startup" ? "startup" : reason === "hard" ? "stall" : "media";
-    const charged = session.book.fail(data.line, {
-      ...(evidence || { kind: defaultKind }),
-      manifestLoaded: instance.manifestLoaded === true,
-    });
-    switchingLine = true;
-    clearStallTimer();
-    setStatus("播放不够流畅，正在更换线路…", "loading");
-    devlog("触发换线", {
-      reason: reason || "-",
-      from: data.provider || "-",
-      fromHost: data.line?.host || hostOf(data.playUrl),
-      continueAt: Math.round(continueAt),
-      evidence: evidence?.kind || defaultKind,
-      ...(charged.length ? { hostStrikes: charged.map((item) => `${item.host}+${item.weight}`).join(",") } : {}),
-    }, "warn");
+    if (preemptLine) {
+      switchingLine = true;
+      clearStallTimer();
+      setStatus("发现更快线路，正在切换…", "loading");
+      devlog("抢先切线", {
+        from: data.provider || "-",
+        fromHost: data.line?.host || hostOf(data.playUrl),
+        fromScore: data.line?.score ?? 0,
+        to: preemptLine.provider || "-",
+        toHost: preemptLine.host || hostOf(preemptLine.playUrl),
+        toScore: preemptLine.score ?? 0,
+      }, "info");
+    } else {
+      // 失败只按证据的范围记账：线路级问题只排除这一条，域名级问题才累计到域名。
+      const defaultKind = reason === "startup" ? "startup" : reason === "hard" ? "stall" : "media";
+      const charged = session.book.fail(data.line, {
+        ...(evidence || { kind: defaultKind }),
+        manifestLoaded: instance.manifestLoaded === true,
+      });
+      switchingLine = true;
+      clearStallTimer();
+      setStatus("播放不够流畅，正在更换线路…", "loading");
+      devlog("触发换线", {
+        reason: reason || "-",
+        from: data.provider || "-",
+        fromHost: data.line?.host || hostOf(data.playUrl),
+        continueAt: Math.round(continueAt),
+        evidence: evidence?.kind || defaultKind,
+        ...(charged.length ? { hostStrikes: charged.map((item) => `${item.host}+${item.weight}`).join(",") } : {}),
+      }, "warn");
+    }
 
-    const state = { refreshed: false };
+    const state = { refreshed: false, pendingPreempt: preemptLine };
     try {
       while (true) {
-        const chosen = await pickNextLine(session, state);
+        let chosen;
+        if (state.pendingPreempt) {
+          chosen = state.pendingPreempt;
+          state.pendingPreempt = null;
+        } else {
+          chosen = await pickNextLine(session, state);
+        }
         if (art !== instance) return;
 
         if (!chosen?.playUrl) {
@@ -1390,11 +1519,12 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         const toProvider = chosen.provider || "未知";
         const toHost = chosen.host || hostOf(chosen.playUrl);
         const switchReasonText =
+          reason === "preempt" ? "起播阶段发现更快线路" :
           reason === "startup" ? "原源起播超时" :
           reason === "hard" ? "原源播放连续断流(>5s)" :
           reason === "unreachable" ? "原源播放列表无法访问" : (reason || "播放异常");
 
-        devlog("切换线路", `【${fromProvider} -> ${toProvider}】(新主机: ${toHost || "-"} | 原因: ${switchReasonText})`, "warn");
+        devlog("切换线路", `【${fromProvider} -> ${toProvider}】(新主机: ${toHost || "-"} | 原因: ${switchReasonText})`, reason === "preempt" ? "info" : "warn");
 
         let watcher = null;
         try {
@@ -1424,7 +1554,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
             currentMedia.playUrl = chosen.playUrl;
             currentMedia.type = chosen.type;
           }
-          const activeVideo = player.querySelector("video");
+          options.onSwitched?.();
+          const activeVideo = instance.video || player.querySelector("video");
           setStatus(activeVideo?.paused ? "线路已切换，请点击播放继续。" : "", "");
           resumeWatchdog?.();
           return;
@@ -1488,7 +1619,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   function showResult(data) {
     clearStallTimer();
     devlogSelection(data);
-    const baseTitle = data.baseTitle || currentMedia?.baseTitle || cleanBaseTitle(data.title);
+    const baseTitle = cleanBaseTitle(data.baseTitle || currentMedia?.baseTitle || data.title, data.episodeName);
     const displayTitle = data.episodeName ? `${baseTitle} ${data.episodeName}` : (data.title || baseTitle);
 
     videoTitle.textContent = displayTitle;
@@ -1501,7 +1632,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       episode: data.episodeName || "",
     });
 
+    const wasFullscreenWeb = Boolean(art?.fullscreenWeb);
     result.hidden = false;
+    syncHomeStageVisibility();
     destroyPlayer();
 
     if (!window.Artplayer || !window.artplayerPluginDanmuku) {
@@ -1531,14 +1664,20 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     // 标题和封面不阻塞起播：事件流里的 meta 事件可能晚于第一条线路，到达后再补。
     const applyMeta = (meta) => {
       if (!meta || currentMedia?.sourceUrl !== data.sourceUrl) return;
+      let changed = false;
       // 目录播放自带标题，不被页面标题覆盖。
       if (meta.title && !data.episodeName && !data.baseTitle) {
         currentMedia.baseTitle = cleanBaseTitle(meta.title);
         currentMedia.title = meta.title;
         videoTitle.textContent = meta.title;
         document.title = `${meta.title} · videoshow`;
+        changed = true;
       }
-      if (meta.cover && !currentMedia.cover) currentMedia.cover = meta.cover;
+      if (meta.cover && !currentMedia.cover) {
+        currentMedia.cover = meta.cover;
+        changed = true;
+      }
+      if (changed) HistoryStore.save(currentMedia);
     };
     if (data.session) {
       data.session.onMeta = applyMeta;
@@ -1547,6 +1686,8 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     // 手动换线时沿用当前进度；否则只恢复这一集自己的进度。
     const savedRecord = HistoryStore.get(currentMedia.id);
+    ActivePlayback.setId(currentMedia.id);
+    HistoryStore.save(currentMedia);
     const resumeTime = Number.isFinite(data.continueAt)
       ? data.continueAt
       : resumeTimeFor(savedRecord, currentMedia);
@@ -1554,6 +1695,15 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     const danmakuEndpoint = data.danmaku?.endpoint || "";
     let playbackFailed = false;
     let sourceAttached = data.type !== "m3u8";
+    let hasFirstFrame = false;
+    let pendingResumeTime = resumeTime;
+    const applyPendingResume = (instance) => {
+      if (pendingResumeTime <= 0 || !instance || art !== instance) return;
+      const target = pendingResumeTime;
+      pendingResumeTime = 0;
+      instance.currentTime = target;
+      instance.notice.show = `已自动恢复至上次进度 ${formatTime(target)}`;
+    };
     const failPlayback = (force = false, reason = "", evidence = null) => {
       if (playbackFailed) {
         // 已在换线：说明是新线路也出了致命错误，立即结束本次尝试，由换线循环换下一个候选。
@@ -1565,7 +1715,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       if (!sourceAttached && !force) return;
       playbackFailed = true;
       clearStallTimer();
-      switchToSmootherSource(data, reason, evidence);
+      switchToSmootherSource(data, reason, evidence, {
+        onSwitched: () => applyPendingResume(activeArt),
+      });
     };
 
     window.Artplayer.PLAYBACK_RATE = PLAYBACK_RATES;
@@ -1580,6 +1732,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       playbackRate: true,
       aspectRatio: true,
       fullscreen: true,
+      fullscreenWeb: true,
       pip: true,
       hotkey: true,
       controls: [
@@ -1599,7 +1752,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         ),
       ],
       autoSize: false,
-      theme: "#c6f36b",
+      theme: "#e0a33a",
       customType: {
         m3u8: (video, url, artInstance) =>
           playM3u8(video, url, artInstance, (reason, evidence) => failPlayback(true, reason, evidence), () => {
@@ -1612,7 +1765,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
           emitter: false,
           theme: "dark",
           fontSize: 20,
-          speed: 5,
+          speed: 7.5,
           opacity: 1,
           antiOverlap: true,
         }),
@@ -1638,7 +1791,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       if (stallTimer || playbackFailed) return;
       stallTimer = window.setInterval(() => {
         if (playbackFailed || switchingLine || art !== activeArt) return;
-        const current = player.querySelector("video");
+        const current = activeArt.video || player.querySelector("video");
         if (!current) return;
         const decision = monitor.tick({
           paused: current.paused,
@@ -1676,21 +1829,47 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     // 这里的判定改成"用户是否想看"：只要没暂停、没结束、确实播放过，就继续渲染，
     // 画面停在某一帧时弹幕保持静止，而不是整层消失。
     keepDanmakuVisibleDuringStall(activeArt);
+    const onLateLine = () => {
+      if (art !== activeArt || hasFirstFrame || switchingLine || playbackFailed) return;
+      const activeVideo = activeArt.video || player.querySelector("video");
+      if (activeVideo && activeVideo.readyState >= 2) {
+        hasFirstFrame = true;
+        return;
+      }
+      const best = data.session?.book?.next();
+      if (!best || !shouldPreemptLine(data.line, best)) return;
+      playbackFailed = true;
+      clearStallTimer();
+      switchToSmootherSource(data, "preempt", null, {
+        preemptLine: best,
+        onSwitched: () => applyPendingResume(activeArt),
+      });
+    };
+    if (data.session) {
+      data.session.onLine = onLateLine;
+    }
+    art.on("video:loadeddata", () => {
+      hasFirstFrame = true;
+    });
     art.on("video:playing", () => {
+      hasFirstFrame = true;
       playbackFailed = false;
       armWatchdog();
       if (status.classList.contains("loading")) setStatus("", "");
     });
     art.on("destroy", () => {
+      if (data.session?.onLine === onLateLine) data.session.onLine = null;
       stopWatchdog();
       activeArt.hls?.destroy();
     });
 
+    art.on("fullscreenWeb", (state) => {
+      document.body.classList.toggle("is-web-fullscreen", Boolean(state));
+      devlog("网页全屏", { enabled: Boolean(state) }, "info");
+    });
+
     art.on("ready", () => {
-      if (resumeTime > 0) {
-        art.currentTime = resumeTime;
-        art.notice.show = `已自动恢复至上次进度 ${formatTime(resumeTime)}`;
-      }
+      applyPendingResume(activeArt);
     });
 
     // 节流保存播放进度
@@ -1698,23 +1877,11 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       const now = Date.now();
       if (now - progressSaveTimer < 3000) return;
       progressSaveTimer = now;
-      if (art && currentMedia && art.duration > 0) {
-        HistoryStore.save({
-          ...currentMedia,
-          currentTime: art.currentTime,
-          duration: art.duration,
-        });
-      }
+      saveCurrentProgress();
     });
 
     art.on("video:pause", () => {
-      if (art && currentMedia && art.duration > 0) {
-        HistoryStore.save({
-          ...currentMedia,
-          currentTime: art.currentTime,
-          duration: art.duration,
-        });
-      }
+      saveCurrentProgress();
     });
 
     art.on("artplayerPluginDanmuku:loaded", (items) => {
@@ -1729,13 +1896,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     art.on("video:ended", () => {
       if (art !== activeArt) return;
-      if (currentMedia && Number.isFinite(art.duration) && art.duration > 0) {
-        HistoryStore.save({
-          ...currentMedia,
-          currentTime: art.currentTime,
-          duration: art.duration,
-        });
-      }
+      saveCurrentProgress();
       playNextEpisode();
     });
 
@@ -1743,6 +1904,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     renderEpisodes(currentMedia.episodes, currentMedia.episodeIndex);
 
     centerPlayer();
+    if (wasFullscreenWeb) {
+      art.fullscreenWeb = true;
+    }
   }
 
   function scrollBehavior() {
@@ -1760,6 +1924,14 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   function placeActiveEpisode(activeIndex) {
     const capsule = episodesScroll?.children[activeIndex];
     if (!capsule) return;
+    if (episodesScroll.scrollHeight > episodesScroll.clientHeight + 4) {
+      const top = capsule.offsetTop - episodesScroll.clientHeight * 0.36 + capsule.offsetHeight / 2;
+      episodesScroll.scrollTo({
+        top: Math.max(0, top),
+        behavior: scrollBehavior(),
+      });
+      return;
+    }
     const left = capsule.offsetLeft - episodesScroll.clientWidth * 0.36 + capsule.offsetWidth / 2;
     episodesScroll.scrollTo({
       left: Math.max(0, left),
@@ -1889,7 +2061,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
     try {
       const data = await resolveLines(pageUrl);
-      const base = currentMedia?.baseTitle || cleanBaseTitle(currentMedia?.title);
+      const base = cleanBaseTitle(currentMedia?.baseTitle || currentMedia?.title, episode.name);
       showResult({
         ...data,
         baseTitle: base,
@@ -1899,15 +2071,131 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
         episodes: currentMedia?.episodes,
       });
     } catch (err) {
+      if (art?.fullscreenWeb) {
+        art.fullscreenWeb = false;
+      }
       setStatus(err instanceof Error ? err.message : "解析失败，请稍后重试。", "error");
     } finally {
       setLoading(false);
     }
   }
 
+  function saveCurrentProgress() {
+    if (art && currentMedia && Number.isFinite(art.duration) && art.duration > 0) {
+      HistoryStore.save({
+        ...currentMedia,
+        currentTime: art.currentTime,
+        duration: art.duration,
+      });
+    }
+  }
+
+  function resumePlaybackItem(item) {
+    if (!item) return;
+    if (item.episodes?.some((episode) => episode.pageUrl)) {
+      const episodeIndex = Math.min(Math.max(item.episodeIndex || 0, 0), item.episodes.length - 1);
+      const epName = item.episodes[episodeIndex]?.name || item.episodeName || "";
+      const base = cleanBaseTitle(item.baseTitle || item.title, epName);
+      currentMedia = {
+        id: item.id,
+        cat: item.cat,
+        titleId: item.titleId,
+        baseTitle: base,
+        title: base,
+        cover: item.cover,
+        platforms: item.platforms || [],
+        platformId: item.platformId || "",
+        episodes: item.episodes,
+      };
+      selectEpisode(item.episodes[episodeIndex], episodeIndex);
+    } else if (item.cat && item.titleId) {
+      const base = cleanBaseTitle(item.baseTitle || item.title, item.episodeName);
+      openTitle({ cat: item.cat, id: item.titleId, title: base, cover: item.cover }, item.episodeIndex || 0);
+    } else if (item.sourceUrl) {
+      input.value = item.sourceUrl;
+      if (clearInputBtn) clearInputBtn.hidden = false;
+      parseVideoUrl(item.sourceUrl);
+    } else if (item.playUrl) {
+      showResult(item);
+    }
+  }
+
   /* =========================================================================
      3. 播放历史渲染与恢复
      ========================================================================= */
+  function syncHomeStageVisibility() {
+    if (!homeStage) return;
+    const showingSearch = Boolean(searchSection && !searchSection.hidden);
+    const showingPlayer = Boolean(result && !result.hidden);
+    homeStage.hidden = showingSearch || showingPlayer;
+    if (!homeStage.hidden) renderHomeRecent();
+  }
+
+  function renderHomeRecent() {
+    if (!recentWatchList) return;
+    const list = HistoryStore.getAll().slice(0, 5);
+    if (homeOpenHistoryBtn) homeOpenHistoryBtn.hidden = list.length === 0;
+    recentWatchList.replaceChildren();
+
+    if (!list.length) {
+      const empty = document.createElement("div");
+      empty.className = "recent-empty";
+      empty.textContent = "暂无最近观看记录。在上方输入剧名搜索或粘贴播放链接即可开始。";
+      recentWatchList.append(empty);
+      return;
+    }
+
+    for (const item of list) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "recent-item";
+
+      const main = document.createElement("div");
+      main.className = "recent-item-main";
+
+      const title = document.createElement("div");
+      title.className = "recent-item-title";
+      title.textContent = item.title || "未命名视频";
+
+      const meta = document.createElement("div");
+      meta.className = "recent-item-meta";
+      if (item.episodeName) {
+        const ep = document.createElement("span");
+        ep.className = "recent-item-ep";
+        ep.textContent = item.episodeName;
+        meta.append(ep);
+      }
+      const progressText = document.createElement("span");
+      const progressPercent = item.duration > 0 ? Math.min(100, Math.round((item.currentTime / item.duration) * 100)) : 0;
+      progressText.textContent = item.duration > 0
+        ? `${formatTime(item.currentTime)} / ${formatTime(item.duration)} (${progressPercent}%)`
+        : "已记录，点击续播";
+      meta.append(progressText);
+
+      main.append(title, meta);
+
+      if (item.duration > 0) {
+        const track = document.createElement("div");
+        track.className = "recent-progress-track";
+        const fill = document.createElement("div");
+        fill.className = "recent-progress-fill";
+        fill.style.width = `${progressPercent}%`;
+        track.append(fill);
+        main.append(track);
+      }
+
+      const action = document.createElement("span");
+      action.className = "recent-item-action";
+      action.textContent = "继续";
+
+      btn.append(main, action);
+      btn.addEventListener("click", () => {
+        resumePlaybackItem(item);
+      });
+      recentWatchList.append(btn);
+    }
+  }
+
   function renderHistory() {
     const list = HistoryStore.getAll();
     historyList.innerHTML = "";
@@ -1924,9 +2212,9 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
       el.innerHTML = `
         <div class="history-meta">
-          <div class="history-title">${item.title}</div>
+          <div class="history-title">${escapeHtml(item.title)}</div>
           <div class="history-details">
-            ${item.episodeName ? `<span class="history-episode">${item.episodeName}</span>` : ""}
+            ${item.episodeName ? `<span class="history-episode">${escapeHtml(item.episodeName)}</span>` : ""}
             <span>进度 ${formatTime(item.currentTime)} / ${formatTime(item.duration)} (${progressPercent}%)</span>
           </div>
         </div>
@@ -1935,28 +2223,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
 
       el.addEventListener("click", () => {
         historyModal.hidden = true;
-        // 恢复播放该条记录
-        if (item.episodes?.some((episode) => episode.pageUrl)) {
-          currentMedia = {
-            id: item.id,
-            cat: item.cat,
-            titleId: item.titleId,
-            baseTitle: item.baseTitle || item.title,
-            title: item.baseTitle || item.title,
-            cover: item.cover,
-            platforms: item.platforms || [],
-            platformId: item.platformId || "",
-            episodes: item.episodes,
-          };
-          selectEpisode(item.episodes[item.episodeIndex || 0], item.episodeIndex || 0);
-        } else if (item.cat && item.titleId) {
-          openTitle({ cat: item.cat, id: item.titleId, title: item.baseTitle || item.title, cover: item.cover }, item.episodeIndex || 0);
-        } else if (item.sourceUrl) {
-          input.value = item.sourceUrl;
-          form.requestSubmit();
-        } else if (item.playUrl) {
-          showResult(item);
-        }
+        resumePlaybackItem(item);
       });
 
       historyList.appendChild(el);
@@ -2053,7 +2320,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       button.className = "site-result";
       const img = document.createElement("img");
       img.alt = "";
-      img.src = item.cover || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 54 72'%3E%3Crect width='54' height='72' fill='%23171b18'/%3E%3C/svg%3E";
+      img.src = item.cover || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 54 72'%3E%3Crect width='54' height='72' fill='%231c1a18'/%3E%3C/svg%3E";
       const copy = document.createElement("div");
       const title = document.createElement("h4");
       title.textContent = item.title || "未命名";
@@ -2198,23 +2465,29 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (!items.length) {
       searchCount.textContent = "未找到相关影视资源";
       searchSection.hidden = false;
+      syncHomeStageVisibility();
       return;
     }
 
     searchCount.textContent = `找到 ${items.length} 部相关作品`;
     searchSection.hidden = false;
+    syncHomeStageVisibility();
 
     items.forEach((item) => {
       const card = document.createElement("div");
       card.className = "search-card";
+      const safeTitle = escapeHtml(item.title);
+      const safeCover = escapeHtml(item.cover || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 96'%3E%3Crect width='72' height='96' fill='%2312110f'/%3E%3C/svg%3E");
+      const remarks = escapeHtml(item.remarks || (item.platforms?.map((platform) => platform.name).join(" / ") || "点击查看播放平台"));
+      const desc = escapeHtml(item.desc || "点击展开选集并播放");
       card.innerHTML = `
-        <img class="search-card-poster" src="${item.cover || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 96'%3E%3Crect width='72' height='96' fill='%23171b18'/%3E%3C/svg%3E"}" alt="${item.title}" loading="lazy" />
+        <img class="search-card-poster" src="${safeCover}" alt="${safeTitle}" loading="lazy" />
         <div class="search-card-info">
           <div>
-            <h4 class="search-card-title" title="${item.title}">${item.title}</h4>
-            <div class="search-card-remarks">${item.remarks || (item.platforms?.map((platform) => platform.name).join(" / ") || "点击查看播放平台")}</div>
+            <h4 class="search-card-title" title="${safeTitle}">${safeTitle}</h4>
+            <div class="search-card-remarks">${remarks}</div>
           </div>
-          <p class="search-card-desc">${item.desc || "点击展开选集并播放"}</p>
+          <p class="search-card-desc">${desc}</p>
         </div>
       `;
 
@@ -2226,6 +2499,24 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     });
 
     searchSection.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function parseVideoUrl(pageUrl) {
+    const msg = "正在解析视频链接，请稍候…";
+    setStatus("", "");
+    setLoading(true, msg);
+    searchSection.hidden = true;
+    try {
+      const data = await withEpisodes(pageUrl, resolveLines(pageUrl));
+      showResult(data);
+    } catch (err) {
+      setStatus(
+        err instanceof Error ? err.message : "解析失败，请稍后重试。",
+        "error",
+      );
+    } finally {
+      setLoading(false);
+    }
   }
 
   /* =========================================================================
@@ -2245,21 +2536,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (searchHistory) searchHistory.hidden = true;
     if (isUrl(query)) {
       // 轨道 A：直接 URL 单集解析
-      const msg = "正在解析视频链接，请稍候…";
-      setStatus("", "");
-      setLoading(true, msg);
-      searchSection.hidden = true;
-      try {
-        const data = await withEpisodes(query, resolveLines(query));
-        showResult(data);
-      } catch (err) {
-        setStatus(
-          err instanceof Error ? err.message : "解析失败，请稍后重试。",
-          "error",
-        );
-      } finally {
-        setLoading(false);
-      }
+      await parseVideoUrl(query);
     } else {
       // 轨道 B：按搜索渠道二选一
       const channel = searchChannelSelect?.value === "sites" ? "sites" : "api";
@@ -2349,12 +2626,14 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
   }
 
   // 历史记录弹窗事件
+  const openHistoryModal = () => {
+    renderHistory();
+    historyModal.hidden = false;
+  };
   if (historyToggleBtn) {
-    historyToggleBtn.addEventListener("click", () => {
-      renderHistory();
-      historyModal.hidden = false;
-    });
+    historyToggleBtn.addEventListener("click", openHistoryModal);
   }
+  homeOpenHistoryBtn?.addEventListener("click", openHistoryModal);
 
   if (closeHistoryBtn) {
     closeHistoryBtn.addEventListener("click", () => {
@@ -2372,6 +2651,7 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
       if (confirm("确定要清空全部播放历史记录吗？")) {
         HistoryStore.clear();
         renderHistory();
+        renderHomeRecent();
         setStatus("播放历史已清空。", "");
       }
     });
@@ -2396,12 +2676,35 @@ window.renderArtDanmaku = function renderArtDanmaku(item) {
     if (e.target === episodesModal) episodesModal.hidden = true;
   });
 
+  // 未聚焦播放器时（例如跨集自动续播继承了网页全屏），也确保按 Escape 可以退出网页全屏
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && art?.fullscreenWeb) {
+      art.fullscreenWeb = false;
+    }
+  });
+
+  brandLink?.addEventListener("click", () => {
+    ActivePlayback.clear();
+  });
+
+  window.addEventListener("pagehide", saveCurrentProgress);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") saveCurrentProgress();
+  });
+
   const initialUrl = new URLSearchParams(window.location.search).get("url");
   if (initialUrl) {
     input.value = initialUrl;
     if (clearInputBtn) clearInputBtn.hidden = false;
     form.requestSubmit();
+  } else {
+    const activeId = ActivePlayback.getId();
+    const activeRecord = activeId ? HistoryStore.get(activeId) : null;
+    if (activeRecord) {
+      resumePlaybackItem(activeRecord);
+    }
   }
+  syncHomeStageVisibility();
 
   // 返回顶部浮动按钮逻辑
   const backToTopBtn = document.querySelector("#back-to-top");
